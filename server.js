@@ -40,7 +40,7 @@ function clampHistory(history, max = 10) {
 // --- Memory ---
 function defaultMemory() {
   return {
-    rubro: "",
+    sector: "",
     servicio: "",
     redes: "",
     objetivo: "",
@@ -48,7 +48,7 @@ function defaultMemory() {
     cierre_enviado: false,
 
     // qué falta pedir (evita loops)
-    pending: "rubro", // rubro -> servicio -> redes -> objetivo -> none
+    pending: "sector", // sector -> servicio -> redes -> objetivo -> none
 
     // historial reducido
     history: [] // [{role:"user"/"assistant", content:"..."}]
@@ -100,18 +100,18 @@ CONTEXTO DE CAMPAÑA
 Este número pertenece a una campaña especial con 30% de descuento durante los primeros 3 meses en los servicios contratados. Menciónalo de forma natural (ideal al confirmar pase a representante).
 
 INFORMACIÓN MÍNIMA A OBTENER (solo esto)
-1) rubro
+1) sector
 2) servicio: redes / bot / ambos
 3) redes: link o @; si no tiene, nombre del negocio
 4) objetivo: ventas / leads / reservas / posicionamiento
 
 TAREA
-- Usa el estado recibido (rubro/servicio/redes/objetivo/cerrado/cierre_enviado/pending).
+- Usa el estado recibido (sector/servicio/redes/objetivo/cerrado/cierre_enviado/pending).
 - Interpreta respuestas de una palabra según la última pregunta (pending).
-- Pregunta SOLO 1 cosa siguiendo el orden rubro -> servicio -> redes -> objetivo.
+- Pregunta SOLO 1 cosa siguiendo el orden sector -> servicio -> redes -> objetivo.
 - Cuando ya tengas las 4, envía el CIERRE ÚNICO y marca cerrado=true y cierre_enviado=true.
 - Si ya cerraste y el usuario dice ok/gracias/hola/mañana/perfecto/listo/👍 responde SOLO:
-  “¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante.”
+  “¡Listo! Ya quedó registrado 🙌 te escribe un representante.”
 
 CIERRE ÚNICO (usa el servicio y el objetivo final)
 “¡Perfecto! Entonces trabajaremos [servicio] para tu negocio enfocados en [objetivo]. 😊
@@ -122,13 +122,13 @@ Devuelve SOLO JSON válido (sin texto extra), con este formato:
 {
   "reply": "mensaje para el usuario",
   "state": {
-    "rubro": "",
+    "sector": "",
     "servicio": "",
     "redes": "",
     "objetivo": "",
     "cerrado": false,
     "cierre_enviado": false,
-    "pending": "rubro|servicio|redes|objetivo|none"
+    "pending": "sector|servicio|redes|objetivo|none"
   }
 }
 
@@ -140,7 +140,7 @@ Reglas del JSON:
 }
 
 function inferPending(mem) {
-  if (!mem.rubro) return "rubro";
+  if (!mem.sector) return "sector";
   if (!mem.servicio) return "servicio";
   if (!mem.redes) return "redes";
   if (!mem.objetivo) return "objetivo";
@@ -191,7 +191,7 @@ app.post("/mc/reply", async (req, res) => {
     const sys = buildSystemPrompt();
 
     const stateSnapshot = {
-      rubro: mem.rubro,
+      sector: mem.sector,
       servicio: mem.servicio,
       redes: mem.redes,
       objetivo: mem.objetivo,
@@ -232,7 +232,7 @@ app.post("/mc/reply", async (req, res) => {
     const newState = parsed.state || {};
 
     // 4) actualizar memoria (estado)
-    mem.rubro = safeText(newState.rubro) || mem.rubro;
+    mem.sector = safeText(newState.sector) || mem.sector;
     mem.servicio = safeText(newState.servicio) || mem.servicio;
     mem.redes = safeText(newState.redes) || mem.redes;
     mem.objetivo = safeText(newState.objetivo) || mem.objetivo;
