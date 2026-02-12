@@ -9,26 +9,37 @@ app.use(express.json({ limit: "1mb" }));
 const PORT = process.env.PORT || 3000;
 const MC_AUTH_TOKEN = process.env.MC_AUTH_TOKEN || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // cambia si quieres
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const REDIS_URL_RAW = process.env.REDIS_URL || "";
 
-// Redis (recomendado)
-const redisUrl = process.env.REDIS_URL; // ej: rediss://:pass@host:port
-const redis = redisUrl ? new Redis(redisUrl) : null;
-
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+// --- Helpers ---
+function safeText(x) {
+  return String(x ?? "").trim();
+}
 
 function mustAuth(req) {
+  // Si no configuras token, no exige auth (modo dev)
   if (!MC_AUTH_TOKEN) return true;
   return req.headers.authorization === `Bearer ${MC_AUTH_TOKEN}`;
 }
 
-function safeText(x) {
-  return String(x || "").trim();
+function normalizeRedisUrl(url) {
+  const u = safeText(url);
+  if (!u) return "";
+  // Upstash suele requerir TLS => rediss://
+  // Si te llegó redis:// lo convertimos a rediss://
+  if (u.startsWith("redis://")) return "rediss://" + u.slice("redis://".length);
+  return u;
 }
 
+function clampHistory(history, max = 10) {
+  if (!Array.isArray(history)) return [];
+  return history.slice(-max);
+}
+
+// --- Memory ---
 function defaultMemory() {
   return {
-    // estado mínimo (para tu lógica)
     rubro: "",
     servicio: "",
     redes: "",
@@ -36,13 +47,27 @@ function defaultMemory() {
     cerrado: false,
     cierre_enviado: false,
 
-    // historial reducido (para contexto del tono)
+    // qué falta pedir (evita loops)
+    pending: "rubro", // rubro -> servicio -> redes -> objetivo -> none
+
+    // historial reducido
     history: [] // [{role:"user"/"assistant", content:"..."}]
   };
 }
 
+// --- Redis ---
+const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
+const redis = redisUrl
+  ? new Redis(redisUrl, {
+      // Upstash/Redis TLS: en algunos entornos ayuda esto
+      tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
+      maxRetriesPerRequest: 2,
+      enableReadyCheck: true,
+    })
+  : null;
+
 async function loadMemory(contactId) {
-  if (!redis) return defaultMemory(); // sin redis, no persistente (solo demo)
+  if (!redis) return defaultMemory();
   const key = `zia:${contactId}`;
   const raw = await redis.get(key);
   return raw ? JSON.parse(raw) : defaultMemory();
@@ -51,17 +76,19 @@ async function loadMemory(contactId) {
 async function saveMemory(contactId, mem) {
   if (!redis) return;
   const key = `zia:${contactId}`;
-  // TTL 7 días (ajusta)
+  // TTL 7 días
   await redis.set(key, JSON.stringify(mem), "EX", 60 * 60 * 24 * 7);
 }
 
+// --- OpenAI ---
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
 function buildSystemPrompt() {
-  // Tu prompt base + reglas, pero además forzamos salida estructurada
   return `
 Eres Zia Bot, el asistente comercial de Zia Lab Agency. Hablas como una persona real, cercana y profesional, con tono relajado-formal en español natural (RD si aplica).
 
 REGLAS CLAVE
-- No repitas el saludo si ya existe conversación previa.
+- No repitas el saludo si ya existe conversación previa (si el historial ya tiene mensajes del bot).
 - Mensajes cortos (máx. 2-3 líneas).
 - Una sola pregunta por mensaje.
 - Emojis variados y naturales (😊✨🚀🙌🧡).
@@ -79,14 +106,14 @@ INFORMACIÓN MÍNIMA A OBTENER (solo esto)
 4) objetivo: ventas / leads / reservas / posicionamiento
 
 TAREA
-- Usa el estado recibido (rubro/servicio/redes/objetivo/cerrado).
-- Interpreta respuestas de una palabra según la última pregunta.
+- Usa el estado recibido (rubro/servicio/redes/objetivo/cerrado/cierre_enviado/pending).
+- Interpreta respuestas de una palabra según la última pregunta (pending).
 - Pregunta SOLO 1 cosa siguiendo el orden rubro -> servicio -> redes -> objetivo.
-- Cuando ya tengas las 4, envía el CIERRE ÚNICO.
+- Cuando ya tengas las 4, envía el CIERRE ÚNICO y marca cerrado=true y cierre_enviado=true.
 - Si ya cerraste y el usuario dice ok/gracias/hola/mañana/perfecto/listo/👍 responde SOLO:
   “¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante.”
 
-CIERRE ÚNICO
+CIERRE ÚNICO (usa el servicio y el objetivo final)
 “¡Perfecto! Entonces trabajaremos [servicio] para tu negocio enfocados en [objetivo]. 😊
 Un representante de Zia Lab te estará contactando en breve para presentarte la propuesta con el 30% OFF por los primeros 3 meses 🚀”
 
@@ -100,7 +127,8 @@ Devuelve SOLO JSON válido (sin texto extra), con este formato:
     "redes": "",
     "objetivo": "",
     "cerrado": false,
-    "cierre_enviado": false
+    "cierre_enviado": false,
+    "pending": "rubro|servicio|redes|objetivo|none"
   }
 }
 
@@ -111,26 +139,55 @@ Reglas del JSON:
 `;
 }
 
-function clampHistory(history, max = 10) {
-  if (!Array.isArray(history)) return [];
-  return history.slice(-max);
+function inferPending(mem) {
+  if (!mem.rubro) return "rubro";
+  if (!mem.servicio) return "servicio";
+  if (!mem.redes) return "redes";
+  if (!mem.objetivo) return "objetivo";
+  return "none";
 }
 
+function isAck(text) {
+  const t = safeText(text).toLowerCase();
+  return ["ok", "okay", "gracias", "hola", "mañana", "perfecto", "listo", "👍"].includes(t);
+}
+
+// --- Route ---
 app.post("/mc/reply", async (req, res) => {
+  const started = Date.now();
+
   try {
-    if (!mustAuth(req)) return res.status(401).json({ error: "unauthorized" });
+    // Logs mínimos (Render)
+    console.log("[/mc/reply] hit", new Date().toISOString());
 
-    const contactId = safeText(req.body.contact_id);
-    const userText = safeText(req.body.user_text);
+    if (!mustAuth(req)) {
+      console.log("[/mc/reply] unauthorized");
+      return res.status(401).json({ error: "unauthorized" });
+    }
 
-    if (!contactId || !userText) {
-      return res.status(400).json({ error: "missing contact_id or user_text" });
+    const contactId = safeText(req.body?.contact_id);
+    const userText = safeText(req.body?.user_text);
+
+    console.log("[/mc/reply] contact_id:", contactId || "(missing)");
+    console.log("[/mc/reply] user_text:", userText ? `"${userText}"` : "(empty)");
+
+    if (!contactId) {
+      return res.json({ reply: "¿Me confirmas tu mensaje otra vez, porfa? 😊" });
+    }
+    if (!userText) {
+      return res.json({ reply: "Se me quedó el mensaje en blanco 😅 ¿Me lo repites en una línea?" });
     }
 
     // 1) cargar memoria
     const mem = await loadMemory(contactId);
+    mem.pending = inferPending(mem);
 
-    // 2) armar mensajes para el modelo
+    // Si ya cerró y el usuario escribe ack -> respuesta corta
+    if (mem.cierre_enviado && isAck(userText)) {
+      return res.json({ reply: "¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante." });
+    }
+
+    // 2) armar mensajes
     const sys = buildSystemPrompt();
 
     const stateSnapshot = {
@@ -139,7 +196,8 @@ app.post("/mc/reply", async (req, res) => {
       redes: mem.redes,
       objetivo: mem.objetivo,
       cerrado: !!mem.cerrado,
-      cierre_enviado: !!mem.cierre_enviado
+      cierre_enviado: !!mem.cierre_enviado,
+      pending: mem.pending
     };
 
     const messages = [
@@ -149,38 +207,44 @@ app.post("/mc/reply", async (req, res) => {
       { role: "user", content: userText }
     ];
 
-    // 3) llamar OpenAI
+    // 3) OpenAI (forzando JSON)
     const completion = await openai.chat.completions.create({
       model: MODEL,
       messages,
       temperature: 0.2,
-      max_tokens: 220
+      max_tokens: 260,
+      response_format: { type: "json_object" } // <-- clave para no romper JSON
     });
 
-    const raw = completion.choices?.[0]?.message?.content || "";
+    const raw = completion.choices?.[0]?.message?.content || "{}";
 
-    // 4) parsear JSON
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      // fallback: respuesta segura si el modelo no devolvió JSON
+      console.error("[/mc/reply] JSON parse fail:", raw);
       return res.json({
-        reply: "Se me fue la señal un momentito 😅 ¿Me repites eso en una línea, porfa?",
+        reply: "Se me fue la señal un momentito 😅 ¿Me repites eso en una línea, porfa?"
       });
     }
 
-    const reply = safeText(parsed.reply);
+    const reply = safeText(parsed.reply) || "¿Me repites eso en una línea, porfa? 😊";
     const newState = parsed.state || {};
 
-    // 5) actualizar memoria (estado + historial)
+    // 4) actualizar memoria (estado)
     mem.rubro = safeText(newState.rubro) || mem.rubro;
     mem.servicio = safeText(newState.servicio) || mem.servicio;
     mem.redes = safeText(newState.redes) || mem.redes;
     mem.objetivo = safeText(newState.objetivo) || mem.objetivo;
-    mem.cerrado = !!newState.cerrado;
-    mem.cierre_enviado = !!newState.cierre_enviado;
 
+    mem.cerrado = typeof newState.cerrado === "boolean" ? newState.cerrado : mem.cerrado;
+    mem.cierre_enviado =
+      typeof newState.cierre_enviado === "boolean" ? newState.cierre_enviado : mem.cierre_enviado;
+
+    // recalcular pending de forma determinista (anti-loop)
+    mem.pending = inferPending(mem);
+
+    // 5) historial
     mem.history = clampHistory(
       [...(mem.history || []), { role: "user", content: userText }, { role: "assistant", content: reply }],
       12
@@ -188,9 +252,10 @@ app.post("/mc/reply", async (req, res) => {
 
     await saveMemory(contactId, mem);
 
+    console.log("[/mc/reply] done in", Date.now() - started, "ms");
     return res.json({ reply });
   } catch (err) {
-    console.error(err);
+    console.error("[/mc/reply] ERROR:", err?.stack || err);
     return res.json({ reply: "Se me complicó un momentito 😅 ¿Me lo mandas de nuevo en una línea?" });
   }
 });
