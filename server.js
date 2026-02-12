@@ -37,6 +37,65 @@ function clampHistory(history, max = 10) {
   return history.slice(-max);
 }
 
+// ✅ NUEVO: detectar @ / links / nombres raros sin “rechazarlos”
+function looksLikeLinkOrHandle(t) {
+  const s = safeText(t);
+  const low = s.toLowerCase();
+  return (
+    s.includes("@") ||
+    low.includes("http") ||
+    low.includes("www.") ||
+    low.includes(".com") ||
+    low.includes(".do") ||
+    low.includes("instagram") ||
+    low.includes("tiktok") ||
+    low.includes("wa.me")
+  );
+}
+
+function looksLikeBusinessName(t) {
+  const s = safeText(t);
+  if (s.length < 3) return false;
+
+  const low = s.toLowerCase();
+
+  // Evitar confundir respuestas típicas con “nombre”
+  const blocked = new Set([
+    "hola",
+    "buenas",
+    "buenos dias",
+    "buenas tardes",
+    "buenas noches",
+    "ok",
+    "okay",
+    "gracias",
+    "mañana",
+    "perfecto",
+    "listo",
+    "si",
+    "sí",
+    "no",
+    "ambos",
+    "ambas",
+    "redes",
+    "bot",
+    "ventas",
+    "leads",
+    "reservas",
+    "posicionamiento",
+    "👍",
+    "...",
+    "..",
+    ".",
+  ]);
+
+  if (blocked.has(low)) return false;
+
+  // Si no parece link/@ pero tiene 3+ caracteres, lo aceptamos como nombre raro válido.
+  // (permite emojis, números, guiones, mayúsculas, abreviaciones, letras repetidas, etc.)
+  return true;
+}
+
 // --- Memory ---
 function defaultMemory() {
   return {
@@ -95,6 +154,15 @@ REGLAS CLAVE
 - No uses etiquetas tipo “[CLIENTE]”.
 - No hagas propuestas largas, diagnósticos extensos ni bullets.
 - No inventes datos si el usuario no lo dijo.
+
+✅ REGLA PARA NOMBRES/REDES (MUY IMPORTANTE)
+- Cuando estés en el paso "redes" (pending = redes), acepta como válido cualquier texto que parezca:
+  a) un @usuario (ej: @jc_import, @xX-Glow✨),
+  b) un link (contenga "http", ".com", ".do", "instagram", "tiktok", "wa.me"),
+  c) o un NOMBRE DE NEGOCIO aunque sea raro (puede tener emojis, números, guiones, mayúsculas, abreviaciones, letras repetidas).
+- NO pidas repetir solo porque el nombre es “raro”.
+- Solo pide repetir si el mensaje tiene 1-2 caracteres, o es claramente un saludo (hola, ok, gracias), o es un ruido tipo "..." o solo emojis sueltos.
+- Si el texto NO parece link/@ pero tiene 3+ caracteres, guárdalo como nombre del negocio en state.redes.
 
 CONTEXTO DE CAMPAÑA
 Este número pertenece a una campaña especial con 30% de descuento durante los primeros 3 meses en los servicios contratados. Menciónalo de forma natural (ideal al confirmar pase a representante).
@@ -187,6 +255,15 @@ app.post("/mc/reply", async (req, res) => {
       return res.json({ reply: "¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante." });
     }
 
+    // ✅ NUEVO: si estamos en paso "redes", aceptar nombres raros sin hacer que el modelo pida repetir
+    if (mem.pending === "redes" && !mem.redes) {
+      if (looksLikeLinkOrHandle(userText) || looksLikeBusinessName(userText)) {
+        mem.redes = userText; // guardar tal cual
+        mem.pending = inferPending(mem);
+        // no retornamos todavía: dejamos que el modelo pregunte objetivo con el estado ya actualizado
+      }
+    }
+
     // 2) armar mensajes
     const sys = buildSystemPrompt();
 
@@ -234,7 +311,10 @@ app.post("/mc/reply", async (req, res) => {
     // 4) actualizar memoria (estado)
     mem.sector = safeText(newState.sector) || mem.sector;
     mem.servicio = safeText(newState.servicio) || mem.servicio;
+
+    // ✅ NUEVO: si ya guardamos redes arriba, no la sobreescribas con vacío
     mem.redes = safeText(newState.redes) || mem.redes;
+
     mem.objetivo = safeText(newState.objetivo) || mem.objetivo;
 
     mem.cerrado = typeof newState.cerrado === "boolean" ? newState.cerrado : mem.cerrado;
