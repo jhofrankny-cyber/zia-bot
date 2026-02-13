@@ -110,7 +110,7 @@ function defaultMemory() {
     pending: "sector", // sector -> servicio -> redes -> objetivo -> none
 
     // historial reducido
-    history: [] // [{role:"user"/"assistant", content:"..."}]
+    history: [], // [{role:"user"/"assistant", content:"..."}]
   };
 }
 
@@ -119,7 +119,9 @@ const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
 const redis = redisUrl
   ? new Redis(redisUrl, {
       // Upstash/Redis TLS: en algunos entornos ayuda esto
-      tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
+      tls: redisUrl.startsWith("rediss://")
+        ? { rejectUnauthorized: false }
+        : undefined,
       maxRetriesPerRequest: 2,
       enableReadyCheck: true,
     })
@@ -155,35 +157,35 @@ REGLAS CLAVE
 - No hagas propuestas largas, diagnósticos extensos ni bullets.
 - No inventes datos si el usuario no lo dijo.
 
-✅ REGLA PARA NOMBRES/REDES (MUY IMPORTANTE)
-- Cuando estés en el paso "redes" (pending = redes), acepta como válido cualquier texto que parezca:
-  a) un @usuario (ej: @jc_import, @xX-Glow✨),
-  b) un link (contenga "http", ".com", ".do", "instagram", "tiktok", "wa.me"),
-  c) o un NOMBRE DE NEGOCIO aunque sea raro (puede tener emojis, números, guiones, mayúsculas, abreviaciones, letras repetidas).
-- NO pidas repetir solo porque el nombre es “raro”.
-- Solo pide repetir si el mensaje tiene 1-2 caracteres, o es claramente un saludo (hola, ok, gracias), o es un ruido tipo "..." o solo emojis sueltos.
-- Si el texto NO parece link/@ pero tiene 3+ caracteres, guárdalo como nombre del negocio en state.redes.
+OBJETIVO
+Capturar el lead con SOLO 3 preguntas. No envíes demo, no hables de precios, no menciones descuentos.
 
-CONTEXTO DE CAMPAÑA
-Este número pertenece a una campaña especial con 30% de descuento durante los primeros 3 meses en los servicios contratados. Menciónalo de forma natural (ideal al confirmar pase a representante).
+PREGUNTAS (en este orden, SIN botones; incluye ejemplos en el mismo mensaje)
+1) (sector) Tipo de negocio:
+   “¿Qué tipo de negocio tienes? Ejemplos: clínica dental, spa, salón de belleza, consultorio, barbería, estudio, otro.”
 
-INFORMACIÓN MÍNIMA A OBTENER (solo esto)
-1) sector
-2) servicio: redes / bot / ambos
-3) redes: link o @; si no tiene, nombre del negocio
-4) objetivo: ventas / leads / reservas / posicionamiento
+2) (servicio) Qué quiere automatizar primero:
+   “¿Qué te gustaría automatizar primero en WhatsApp? Ejemplos: agendar citas, confirmar/recordatorios, reagendar, información y precios.”
+
+3) (redes) Volumen semanal:
+   “Aprox. ¿cuántas citas manejan por semana? Ejemplos: 5, 15, 30, 60+.”
+
+✅ REGLA PARA RESPUESTAS CORTAS (MUY IMPORTANTE)
+- Cuando estés en el paso "redes" (pending = redes), acepta como válido números o rangos aunque sean cortos: "5", "15", "30", "60+", "más de 60".
+- NO pidas repetir solo por ser corto.
+- Solo pide repetir si viene vacío, o es ruido tipo "...", o solo emojis sueltos.
 
 TAREA
 - Usa el estado recibido (sector/servicio/redes/objetivo/cerrado/cierre_enviado/pending).
 - Interpreta respuestas de una palabra según la última pregunta (pending).
-- Pregunta SOLO 1 cosa siguiendo el orden sector -> servicio -> redes -> objetivo.
-- Cuando ya tengas las 4, envía el CIERRE ÚNICO y marca cerrado=true y cierre_enviado=true.
+- Pregunta SOLO 1 cosa siguiendo el orden sector -> servicio -> redes.
+- Cuando ya tengas las 3 (sector, servicio, redes), NO preguntes más. En ese mismo mensaje:
+  - Envía el cierre corto EXACTO: “Perfecto, gracias 🙌 Con eso listo, seguimos por aquí.”
+  - Marca cerrado=true y cierre_enviado=true.
+  - Setea objetivo="calificado" (para que pending pase a "none").
+
 - Si ya cerraste y el usuario dice ok/gracias/hola/mañana/perfecto/listo/👍 responde SOLO:
   “¡Listo! Ya quedó registrado 🙌 te escribe un representante.”
-
-CIERRE ÚNICO (usa el servicio y el objetivo final)
-“¡Perfecto! Entonces trabajaremos [servicio] para tu negocio enfocados en [objetivo]. 😊
-Un representante de Zia Lab te estará contactando en breve para presentarte la propuesta con el 30% OFF por los primeros 3 meses 🚀”
 
 SALIDA OBLIGATORIA:
 Devuelve SOLO JSON válido (sin texto extra), con este formato:
@@ -274,14 +276,14 @@ app.post("/mc/reply", async (req, res) => {
       objetivo: mem.objetivo,
       cerrado: !!mem.cerrado,
       cierre_enviado: !!mem.cierre_enviado,
-      pending: mem.pending
+      pending: mem.pending,
     };
 
     const messages = [
       { role: "system", content: sys },
       { role: "system", content: `ESTADO ACTUAL: ${JSON.stringify(stateSnapshot)}` },
       ...clampHistory(mem.history, 10),
-      { role: "user", content: userText }
+      { role: "user", content: userText },
     ];
 
     // 3) OpenAI (forzando JSON)
@@ -290,7 +292,7 @@ app.post("/mc/reply", async (req, res) => {
       messages,
       temperature: 0.2,
       max_tokens: 260,
-      response_format: { type: "json_object" } // <-- clave para no romper JSON
+      response_format: { type: "json_object" }, // <-- clave para no romper JSON
     });
 
     const raw = completion.choices?.[0]?.message?.content || "{}";
@@ -301,7 +303,7 @@ app.post("/mc/reply", async (req, res) => {
     } catch (e) {
       console.error("[/mc/reply] JSON parse fail:", raw);
       return res.json({
-        reply: "Se me fue la señal un momentito 😅 ¿Me repites eso en una línea, porfa?"
+        reply: "Se me fue la señal un momentito 😅 ¿Me repites eso en una línea, porfa?",
       });
     }
 
