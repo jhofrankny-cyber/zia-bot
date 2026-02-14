@@ -97,14 +97,70 @@ function looksLikeBusinessName(t) {
   if (blocked.has(low)) return false;
 
   // Si no parece link/@ pero tiene 3+ caracteres, lo aceptamos como nombre raro válido.
-  // (permite emojis, números, guiones, mayúsculas, abreviaciones, letras repetidas, etc.)
   return true;
 }
 
-// ✅ NUEVO: detectar URL de audio en payload (soporta varios nombres comunes)
+// ✅ NUEVO: detectar si el texto parece ser un archivo de audio por URL
+function looksLikeAudioUrl(t) {
+  const s = safeText(t).toLowerCase();
+  if (!s) return false;
+  if (!s.startsWith("http")) return false;
+
+  // extensiones típicas de notas de voz / audio
+  const audioExt = [".ogg", ".opus", ".mp3", ".m4a", ".wav", ".webm", ".aac"];
+  return audioExt.some((ext) => s.includes(ext));
+}
+
+// ✅ NUEVO: extraer algún URL de audio si viene en campos alternos
+function tryParseJson(x) {
+  if (!x) return null;
+  if (typeof x === "object") return x;
+  const s = safeText(x);
+  if (!s) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+function findFirstUrlDeep(input) {
+  const seen = new Set();
+
+  function walk(x) {
+    if (x == null) return "";
+    if (typeof x === "string") {
+      const s = x.trim();
+      const m = s.match(/https?:\/\/[^\s"']+/i);
+      return m ? m[0] : "";
+    }
+    if (typeof x !== "object") return "";
+
+    if (seen.has(x)) return "";
+    seen.add(x);
+
+    if (Array.isArray(x)) {
+      for (const item of x) {
+        const u = walk(item);
+        if (u) return u;
+      }
+      return "";
+    }
+
+    for (const k of Object.keys(x)) {
+      const u = walk(x[k]);
+      if (u) return u;
+    }
+    return "";
+  }
+
+  return walk(input);
+}
+
 function getAudioUrl(body) {
   if (!body || typeof body !== "object") return "";
 
+  // Campos directos por si los agregas luego
   const direct =
     body.voice_url ||
     body.audio_url ||
@@ -115,14 +171,30 @@ function getAudioUrl(body) {
     body.audio ||
     "";
 
-  if (direct) return safeText(direct);
+  if (direct) {
+    const parsed = tryParseJson(direct);
+    if (parsed) {
+      const u = findFirstUrlDeep(parsed);
+      if (u) return safeText(u);
+    }
+    const u2 = findFirstUrlDeep(String(direct));
+    if (u2) return safeText(u2);
+  }
 
-  // Por si viene en arrays/objetos
+  // Attachments comunes
   const a1 = body.attachments?.[0]?.url || body.attachments?.[0]?.payload?.url;
   if (a1) return safeText(a1);
 
   const a2 = body.message?.attachments?.[0]?.url || body.message?.attachments?.[0]?.payload?.url;
   if (a2) return safeText(a2);
+
+  // ManyChat: Full Contact Data puede traer cosas escondidas
+  const fcd = body.full_contact_data;
+  if (fcd) {
+    const parsed = tryParseJson(fcd) || fcd;
+    const u = findFirstUrlDeep(parsed);
+    if (u) return safeText(u);
+  }
 
   return "";
 }
@@ -137,7 +209,7 @@ function extFromContentType(ct) {
   if (c.includes("audio/x-m4a")) return "m4a";
   if (c.includes("audio/wav")) return "wav";
   if (c.includes("audio/webm")) return "webm";
-  return "ogg"; // default safe para WhatsApp (ogg/opus)
+  return "ogg";
 }
 
 // ✅ NUEVO: transcribir audio desde URL (nota de voz)
@@ -150,10 +222,7 @@ async function transcribeAudioFromUrl(url, openaiClient) {
       responseType: "arraybuffer",
       maxRedirects: 5,
       timeout: 20000,
-      headers: {
-        // algunos hosts piden user-agent
-        "User-Agent": "Mozilla/5.0",
-      },
+      headers: { "User-Agent": "Mozilla/5.0" },
     });
 
     const ct = resp.headers?.["content-type"] || "";
@@ -184,16 +253,13 @@ function defaultMemory() {
   return {
     sector: "",
     servicio: "",
-    redes: "",
-    objetivo: "",
+    redes: "",      // aquí guardaremos: citas por semana (mantengo el nombre para no romper nada)
+    objetivo: "",   // se mantiene por compatibilidad, pero ya no se pregunta
     cerrado: false,
     cierre_enviado: false,
 
-    // qué falta pedir (evita loops)
-    pending: "sector", // sector -> servicio -> redes -> objetivo -> none
-
-    // historial reducido
-    history: [], // [{role:"user"/"assistant", content:"..."}]
+    pending: "sector", // sector -> servicio -> redes -> none
+    history: [],
   };
 }
 
@@ -201,7 +267,6 @@ function defaultMemory() {
 const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
 const redis = redisUrl
   ? new Redis(redisUrl, {
-      // Upstash/Redis TLS: en algunos entornos ayuda esto
       tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
       maxRetriesPerRequest: 2,
       enableReadyCheck: true,
@@ -218,7 +283,6 @@ async function loadMemory(contactId) {
 async function saveMemory(contactId, mem) {
   if (!redis) return;
   const key = `zia:${contactId}`;
-  // TTL 7 días
   await redis.set(key, JSON.stringify(mem), "EX", 60 * 60 * 24 * 7);
 }
 
@@ -248,7 +312,7 @@ PREGUNTAS (en este orden, SIN botones; incluye ejemplos en el mismo mensaje)
 2) (servicio) Qué quiere automatizar primero:
    “¿Qué te gustaría automatizar primero en WhatsApp? Ejemplos: agendar citas, confirmar/recordatorios, reagendar, información y precios.”
 
-3) (redes) Volumen semanal:
+3) (redes) Volumen semanal (citas por semana):
    “Aprox. ¿cuántas citas manejan por semana? Ejemplos: 5, 15, 30, 60+.”
 
 ✅ REGLA PARA MENSAJES LARGOS / AUDIO TRANSCRITO (MUY IMPORTANTE)
@@ -294,11 +358,11 @@ Reglas del JSON:
 `;
 }
 
+// ✅ Ajuste mínimo: 3 preguntas determinísticas (no depende de objetivo)
 function inferPending(mem) {
   if (!mem.sector) return "sector";
   if (!mem.servicio) return "servicio";
   if (!mem.redes) return "redes";
-  if (!mem.objetivo) return "objetivo";
   return "none";
 }
 
@@ -312,7 +376,6 @@ app.post("/mc/reply", async (req, res) => {
   const started = Date.now();
 
   try {
-    // Logs mínimos (Render)
     console.log("[/mc/reply] hit", new Date().toISOString());
 
     if (!mustAuth(req)) {
@@ -330,23 +393,30 @@ app.post("/mc/reply", async (req, res) => {
       return res.json({ reply: "¿Me confirmas tu mensaje otra vez, porfa? 😊" });
     }
 
-    // ✅ NUEVO: si viene nota de voz (y user_text vacío), transcribimos
-    if (!userText) {
-      const audioUrl = getAudioUrl(req.body);
-      if (audioUrl) {
-        console.log("[/mc/reply] audio_url detected:", audioUrl);
-        const transcript = await transcribeAudioFromUrl(audioUrl, openai);
-        if (transcript) {
-          userText = transcript;
-          console.log("[/mc/reply] transcript:", `"${userText}"`);
-        } else {
-          return res.json({
-            reply: "No pude escuchar bien la nota de voz 😅 ¿Me lo puedes mandar en texto o reenviar el audio más claro?",
-          });
-        }
+    // ✅ NUEVO: si user_text es un link de audio (como manybot-files...ogg), lo transcribimos
+    let audioUrl = "";
+    if (looksLikeAudioUrl(userText)) {
+      audioUrl = userText;
+    } else if (!userText) {
+      audioUrl = getAudioUrl(req.body);
+    }
+
+    if (audioUrl) {
+      console.log("[/mc/reply] audio_url detected:", audioUrl);
+      const transcript = await transcribeAudioFromUrl(audioUrl, openai);
+
+      if (transcript) {
+        userText = transcript;
+        console.log("[/mc/reply] transcript:", `"${userText}"`);
       } else {
-        return res.json({ reply: "Se me quedó el mensaje en blanco 😅 ¿Me lo repites en una línea?" });
+        return res.json({
+          reply: "No pude escuchar bien la nota de voz 😅 ¿Me lo puedes mandar en texto o reenviar el audio más claro?",
+        });
       }
+    }
+
+    if (!userText) {
+      return res.json({ reply: "Se me quedó el mensaje en blanco 😅 ¿Me lo repites en una línea?" });
     }
 
     // 1) cargar memoria
@@ -356,15 +426,6 @@ app.post("/mc/reply", async (req, res) => {
     // Si ya cerró y el usuario escribe ack -> respuesta corta
     if (mem.cierre_enviado && isAck(userText)) {
       return res.json({ reply: "¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante." });
-    }
-
-    // ✅ NUEVO: si estamos en paso "redes", aceptar nombres raros sin hacer que el modelo pida repetir
-    if (mem.pending === "redes" && !mem.redes) {
-      if (looksLikeLinkOrHandle(userText) || looksLikeBusinessName(userText)) {
-        mem.redes = userText; // guardar tal cual
-        mem.pending = inferPending(mem);
-        // no retornamos todavía: dejamos que el modelo pregunte lo siguiente con el estado ya actualizado
-      }
     }
 
     // 2) armar mensajes
@@ -393,7 +454,7 @@ app.post("/mc/reply", async (req, res) => {
       messages,
       temperature: 0.2,
       max_tokens: 260,
-      response_format: { type: "json_object" }, // <-- clave para no romper JSON
+      response_format: { type: "json_object" },
     });
 
     const raw = completion.choices?.[0]?.message?.content || "{}";
@@ -414,17 +475,16 @@ app.post("/mc/reply", async (req, res) => {
     // 4) actualizar memoria (estado)
     mem.sector = safeText(newState.sector) || mem.sector;
     mem.servicio = safeText(newState.servicio) || mem.servicio;
-
-    // ✅ NUEVO: si ya guardamos redes arriba, no la sobreescribas con vacío
     mem.redes = safeText(newState.redes) || mem.redes;
 
+    // objetivo se mantiene por compatibilidad; lo puede setear el modelo a "calificado"
     mem.objetivo = safeText(newState.objetivo) || mem.objetivo;
 
     mem.cerrado = typeof newState.cerrado === "boolean" ? newState.cerrado : mem.cerrado;
     mem.cierre_enviado =
       typeof newState.cierre_enviado === "boolean" ? newState.cierre_enviado : mem.cierre_enviado;
 
-    // recalcular pending de forma determinista (anti-loop)
+    // recalcular pending determinista (3 preguntas)
     mem.pending = inferPending(mem);
 
     // 5) historial
