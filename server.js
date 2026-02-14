@@ -17,11 +17,10 @@ const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const REDIS_URL_RAW = process.env.REDIS_URL || "";
 const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1";
 
-// ✅ NUEVO (WhatsApp Cloud API Notify)
-const WA_TOKEN = process.env.WA_TOKEN || "";
-const WA_PHONE_NUMBER_ID =
-  process.env.WA_PHONE_NUMBER_ID || process.env.PHONE_NUMBER_ID || "";
-const ADMIN_PHONE = process.env.ADMIN_PHONE || "";
+// ✅ NUEVO: ManyChat Admin Notify (Opción A)
+const MANYCHAT_API_KEY = process.env.MANYCHAT_API_KEY || "";
+const ADMIN_SUBSCRIBER_ID = process.env.ADMIN_SUBSCRIBER_ID || "";
+const MANYCHAT_API_BASE = process.env.MANYCHAT_API_BASE || "https://api.manychat.com";
 
 // --- Helpers ---
 function safeText(x) {
@@ -185,9 +184,7 @@ function getAudioUrl(body) {
   const a1 = body.attachments?.[0]?.url || body.attachments?.[0]?.payload?.url;
   if (a1) return safeText(a1);
 
-  const a2 =
-    body.message?.attachments?.[0]?.url ||
-    body.message?.attachments?.[0]?.payload?.url;
+  const a2 = body.message?.attachments?.[0]?.url || body.message?.attachments?.[0]?.payload?.url;
   if (a2) return safeText(a2);
 
   const fcd = body.full_contact_data;
@@ -244,11 +241,7 @@ async function transcribeAudioFromUrl(url, openaiClient) {
       fs.unlink(tmpPath, () => {});
     }
   } catch (err) {
-    console.error(
-      "[transcribe] ERROR:",
-      err?.response?.status,
-      err?.message || err
-    );
+    console.error("[transcribe] ERROR:", err?.response?.status, err?.message || err);
     return "";
   }
 }
@@ -282,52 +275,44 @@ function safeParseModelJson(raw) {
   return null;
 }
 
-// ✅ NUEVO: WhatsApp Notify helpers
-function digitsOnly(x) {
+// ✅ NUEVO: ManyChat notify helpers
+function canNotifyAdminViaManyChat() {
+  return !!(MANYCHAT_API_KEY && ADMIN_SUBSCRIBER_ID);
+}
+
+function toDigits(x) {
   return safeText(x).replace(/[^\d]/g, "");
 }
 
-function isLikelyPhoneDigits(x) {
-  const d = digitsOnly(x);
-  return d.length >= 9 && d.length <= 15;
-}
-
-function canSendAdminWhatsApp() {
-  return !!(WA_TOKEN && WA_PHONE_NUMBER_ID && ADMIN_PHONE);
-}
-
-function buildLeadMessage({ contactId, sector, servicio, redes }) {
-  const wa = isLikelyPhoneDigits(contactId) ? digitsOnly(contactId) : "";
-  const link = wa ? `https://wa.me/${wa}` : "";
+function buildLeadSummary({ contactId, sector, servicio, redes }) {
+  const waDigits = toDigits(contactId);
+  const waLink = waDigits ? `https://wa.me/${waDigits}` : "";
 
   return (
     `🆕 Nuevo lead (Zia Bot)\n` +
     `📌 Negocio: ${safeText(sector) || "-"}\n` +
     `🤖 Automatizar: ${safeText(servicio) || "-"}\n` +
     `📅 Citas/semana: ${safeText(redes) || "-"}\n` +
-    `👤 Cliente: ${wa || safeText(contactId) || "-"}\n` +
-    (link ? `🔗 ${link}\n` : "") +
-    `🕒 ${new Date().toISOString()}`
+    `👤 WhatsApp: ${waDigits || safeText(contactId) || "-"}\n` +
+    (waLink ? `🔗 ${waLink}\n` : "") +
+    `🕒 ${new Date().toLocaleString()}`
   );
 }
 
-async function sendWhatsAppText(toDigits, text) {
-  const to = digitsOnly(toDigits);
-  if (!to) throw new Error("ADMIN_PHONE inválido");
-
-  const url = `https://graph.facebook.com/v20.0/${WA_PHONE_NUMBER_ID}/messages`;
+// ⚠️ Endpoint típico de ManyChat para WhatsApp (si tu cuenta lo tiene habilitado)
+// Si te diera 404, te digo en 1 mensaje cuál endpoint alterno cambiar.
+async function sendAdminWhatsAppViaManyChat(text) {
+  const url = `${MANYCHAT_API_BASE}/whatsapp/sending/sendText`;
 
   await axios.post(
     url,
     {
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text },
+      subscriber_id: Number(ADMIN_SUBSCRIBER_ID),
+      message: safeText(text),
     },
     {
       headers: {
-        Authorization: `Bearer ${WA_TOKEN}`,
+        Authorization: `Bearer ${MANYCHAT_API_KEY}`,
         "Content-Type": "application/json",
       },
       timeout: 20000,
@@ -340,15 +325,15 @@ function defaultMemory() {
   return {
     sector: "",
     servicio: "",
-    redes: "", // citas/semana
-    objetivo: "", // compat
+    redes: "",
+    objetivo: "",
     cerrado: false,
     cierre_enviado: false,
     pending: "sector",
     history: [],
 
-    // ✅ NUEVO: evitar notificar 2 veces
-    lead_notified: false,
+    // ✅ NUEVO: evitar enviar el aviso 2 veces
+    admin_notified: false,
   };
 }
 
@@ -356,9 +341,7 @@ function defaultMemory() {
 const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
 const redis = redisUrl
   ? new Redis(redisUrl, {
-      tls: redisUrl.startsWith("rediss://")
-        ? { rejectUnauthorized: false }
-        : undefined,
+      tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
       maxRetriesPerRequest: 2,
       enableReadyCheck: true,
     })
@@ -370,8 +353,7 @@ async function loadMemory(contactId) {
   const raw = await redis.get(key);
   const mem = raw ? JSON.parse(raw) : defaultMemory();
 
-  // compat con memorias viejas
-  if (typeof mem.lead_notified !== "boolean") mem.lead_notified = false;
+  if (typeof mem.admin_notified !== "boolean") mem.admin_notified = false;
 
   return mem;
 }
@@ -440,7 +422,6 @@ Devuelve SOLO JSON válido (sin texto extra), con este formato:
 `;
 }
 
-// ✅ 3 pasos deterministas
 function inferPending(mem) {
   if (!mem.sector) return "sector";
   if (!mem.servicio) return "servicio";
@@ -510,7 +491,7 @@ app.post("/mc/reply", async (req, res) => {
       return res.json({ reply: "¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante." });
     }
 
-    // ✅ (tu lógica existente) aceptar nombres raros en paso "redes"
+    // ✅ aceptar nombres raros en paso "redes"
     if (mem.pending === "redes" && !mem.redes) {
       if (looksLikeLinkOrHandle(userText) || looksLikeBusinessName(userText)) {
         mem.redes = userText;
@@ -603,14 +584,14 @@ app.post("/mc/reply", async (req, res) => {
 
     await saveMemory(contactId, mem);
 
-    // ✅ NUEVO: Notificar a tu WhatsApp cuando el lead esté completo (solo 1 vez)
+    // ✅ NUEVO: cuando el lead está completo y ya cerró -> avisar a tu WhatsApp via ManyChat (1 vez)
     const leadComplete = !!(mem.sector && mem.servicio && mem.redes && mem.cierre_enviado);
-    if (leadComplete && !mem.lead_notified) {
-      mem.lead_notified = true; // evita duplicados aunque falle el envío
+    if (leadComplete && !mem.admin_notified) {
+      mem.admin_notified = true;
       await saveMemory(contactId, mem);
 
-      if (canSendAdminWhatsApp()) {
-        const msg = buildLeadMessage({
+      if (canNotifyAdminViaManyChat()) {
+        const summary = buildLeadSummary({
           contactId,
           sector: mem.sector,
           servicio: mem.servicio,
@@ -618,15 +599,13 @@ app.post("/mc/reply", async (req, res) => {
         });
 
         try {
-          await sendWhatsAppText(ADMIN_PHONE, msg);
-          console.log("[lead_notify] sent to admin ✅");
+          await sendAdminWhatsAppViaManyChat(summary);
+          console.log("[admin_notify] sent ✅");
         } catch (e) {
-          console.error("[lead_notify] FAILED:", e?.response?.status, e?.message || e);
+          console.error("[admin_notify] FAILED:", e?.response?.status, e?.response?.data || e?.message || e);
         }
       } else {
-        console.log(
-          "[lead_notify] skipped (missing WA_TOKEN/WA_PHONE_NUMBER_ID/ADMIN_PHONE)"
-        );
+        console.log("[admin_notify] skipped (missing MANYCHAT_API_KEY/ADMIN_SUBSCRIBER_ID)");
       }
     }
 
