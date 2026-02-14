@@ -42,7 +42,7 @@ function clampHistory(history, max = 10) {
   return history.slice(-max);
 }
 
-// ✅ NUEVO: detectar @ / links / nombres raros sin “rechazarlos”
+// ✅ detectar @ / links / nombres raros sin “rechazarlos”
 function looksLikeLinkOrHandle(t) {
   const s = safeText(t);
   const low = s.toLowerCase();
@@ -64,7 +64,6 @@ function looksLikeBusinessName(t) {
 
   const low = s.toLowerCase();
 
-  // Evitar confundir respuestas típicas con “nombre”
   const blocked = new Set([
     "hola",
     "buenas",
@@ -95,23 +94,19 @@ function looksLikeBusinessName(t) {
   ]);
 
   if (blocked.has(low)) return false;
-
-  // Si no parece link/@ pero tiene 3+ caracteres, lo aceptamos como nombre raro válido.
   return true;
 }
 
-// ✅ NUEVO: detectar si el texto parece ser un archivo de audio por URL
+// ✅ detectar si user_text es link de audio
 function looksLikeAudioUrl(t) {
   const s = safeText(t).toLowerCase();
   if (!s) return false;
   if (!s.startsWith("http")) return false;
-
-  // extensiones típicas de notas de voz / audio
   const audioExt = [".ogg", ".opus", ".mp3", ".m4a", ".wav", ".webm", ".aac"];
   return audioExt.some((ext) => s.includes(ext));
 }
 
-// ✅ NUEVO: extraer algún URL de audio si viene en campos alternos
+// ✅ helpers para buscar URLs dentro de objetos/string JSON
 function tryParseJson(x) {
   if (!x) return null;
   if (typeof x === "object") return x;
@@ -157,10 +152,10 @@ function findFirstUrlDeep(input) {
   return walk(input);
 }
 
+// ✅ extraer URL de audio si viene en otros campos
 function getAudioUrl(body) {
   if (!body || typeof body !== "object") return "";
 
-  // Campos directos por si los agregas luego
   const direct =
     body.voice_url ||
     body.audio_url ||
@@ -181,14 +176,12 @@ function getAudioUrl(body) {
     if (u2) return safeText(u2);
   }
 
-  // Attachments comunes
   const a1 = body.attachments?.[0]?.url || body.attachments?.[0]?.payload?.url;
   if (a1) return safeText(a1);
 
   const a2 = body.message?.attachments?.[0]?.url || body.message?.attachments?.[0]?.payload?.url;
   if (a2) return safeText(a2);
 
-  // ManyChat: Full Contact Data puede traer cosas escondidas
   const fcd = body.full_contact_data;
   if (fcd) {
     const parsed = tryParseJson(fcd) || fcd;
@@ -212,7 +205,7 @@ function extFromContentType(ct) {
   return "ogg";
 }
 
-// ✅ NUEVO: transcribir audio desde URL (nota de voz)
+// ✅ transcribir audio desde URL
 async function transcribeAudioFromUrl(url, openaiClient) {
   const u = safeText(url);
   if (!u) return "";
@@ -248,17 +241,45 @@ async function transcribeAudioFromUrl(url, openaiClient) {
   }
 }
 
+// ✅ NUEVO: parser robusto para JSON del modelo
+function extractFirstJsonObject(raw) {
+  const s = safeText(raw);
+  if (!s) return "";
+  const noFences = s.replace(/```json|```/gi, "").trim();
+  const first = noFences.indexOf("{");
+  const last = noFences.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) return "";
+  return noFences.slice(first, last + 1);
+}
+
+function safeParseModelJson(raw) {
+  const s = safeText(raw);
+  if (!s) return null;
+
+  try {
+    return JSON.parse(s);
+  } catch {}
+
+  const candidate = extractFirstJsonObject(s);
+  if (candidate) {
+    try {
+      return JSON.parse(candidate);
+    } catch {}
+  }
+
+  return null;
+}
+
 // --- Memory ---
 function defaultMemory() {
   return {
     sector: "",
     servicio: "",
-    redes: "",      // aquí guardaremos: citas por semana (mantengo el nombre para no romper nada)
-    objetivo: "",   // se mantiene por compatibilidad, pero ya no se pregunta
+    redes: "", // aquí guardamos citas/semana (sin romper nombres)
+    objetivo: "", // se mantiene por compatibilidad
     cerrado: false,
     cierre_enviado: false,
-
-    pending: "sector", // sector -> servicio -> redes -> none
+    pending: "sector",
     history: [],
   };
 }
@@ -307,34 +328,25 @@ Capturar el lead con SOLO 3 preguntas. No envíes demo, no hables de precios, no
 
 PREGUNTAS (en este orden, SIN botones; incluye ejemplos en el mismo mensaje)
 1) (sector) Tipo de negocio:
-   “¿Qué tipo de negocio tienes? Ejemplos: clínica dental, spa, salón de belleza, consultorio, barbería, estudio, otro.”
+“¿Qué tipo de negocio tienes? Ejemplos: clínica dental, spa, salón de belleza, consultorio, barbería, estudio, otro.”
 
 2) (servicio) Qué quiere automatizar primero:
-   “¿Qué te gustaría automatizar primero en WhatsApp? Ejemplos: agendar citas, confirmar/recordatorios, reagendar, información y precios.”
+“¿Qué te gustaría automatizar primero en WhatsApp? Ejemplos: agendar citas, confirmar/recordatorios, reagendar, información y precios.”
 
 3) (redes) Volumen semanal (citas por semana):
-   “Aprox. ¿cuántas citas manejan por semana? Ejemplos: 5, 15, 30, 60+.”
+“Aprox. ¿cuántas citas manejan por semana? Ejemplos: 5, 15, 30, 60+.”
 
-✅ REGLA PARA MENSAJES LARGOS / AUDIO TRANSCRITO (MUY IMPORTANTE)
+REGLAS IMPORTANTES
 - Si el usuario responde varias cosas en un mismo mensaje (incluyendo audio transcrito), extrae y guarda TODO lo que puedas para: sector, servicio y redes.
 - Si ya tienes las 3 respuestas, NO preguntes más: cierra.
-
-✅ REGLA PARA RESPUESTAS CORTAS (MUY IMPORTANTE)
-- Cuando estés en el paso "redes" (pending = redes), acepta como válido números o rangos aunque sean cortos: "5", "15", "30", "60+", "más de 60".
-- NO pidas repetir solo por ser corto.
-- Solo pide repetir si viene vacío, o es ruido tipo "...", o solo emojis sueltos.
+- En "redes" acepta números cortos: "5", "15", "30", "60+".
 
 TAREA
 - Usa el estado recibido (sector/servicio/redes/objetivo/cerrado/cierre_enviado/pending).
-- Interpreta respuestas de una palabra según la última pregunta (pending).
 - Pregunta SOLO 1 cosa siguiendo el orden sector -> servicio -> redes.
-- Cuando ya tengas las 3 (sector, servicio, redes), NO preguntes más. En ese mismo mensaje:
-  - Envía el cierre corto EXACTO: “¡Listo! Ya quedó registrado 🙌 te escribe un representante.”
-  - Marca cerrado=true y cierre_enviado=true.
-  - Setea objetivo="calificado" (para que pending pase a "none").
-
-- Si ya cerraste y el usuario dice ok/gracias/hola/mañana/perfecto/listo/👍 responde SOLO:
+- Cuando ya tengas las 3, responde EXACTO:
   “¡Listo! Ya quedó registrado 🙌 te escribe un representante.”
+  y marca cerrado=true, cierre_enviado=true y objetivo="calificado".
 
 SALIDA OBLIGATORIA:
 Devuelve SOLO JSON válido (sin texto extra), con este formato:
@@ -347,18 +359,13 @@ Devuelve SOLO JSON válido (sin texto extra), con este formato:
     "objetivo": "",
     "cerrado": false,
     "cierre_enviado": false,
-    "pending": "sector|servicio|redes|objetivo|none"
+    "pending": "sector|servicio|redes|none"
   }
 }
-
-Reglas del JSON:
-- "reply" debe ser lo que se enviará al usuario.
-- "state" debe venir actualizado según el último mensaje del usuario y el estado previo.
-- Nunca inventes datos: si no lo dijo, déjalo igual.
 `;
 }
 
-// ✅ Ajuste mínimo: 3 preguntas determinísticas (no depende de objetivo)
+// ✅ 3 pasos deterministas
 function inferPending(mem) {
   if (!mem.sector) return "sector";
   if (!mem.servicio) return "servicio";
@@ -393,7 +400,7 @@ app.post("/mc/reply", async (req, res) => {
       return res.json({ reply: "¿Me confirmas tu mensaje otra vez, porfa? 😊" });
     }
 
-    // ✅ NUEVO: si user_text es un link de audio (como manybot-files...ogg), lo transcribimos
+    // ✅ Si user_text es link de audio (.ogg) o viene vacío pero hay audio en otros campos -> transcribir
     let audioUrl = "";
     if (looksLikeAudioUrl(userText)) {
       audioUrl = userText;
@@ -428,6 +435,14 @@ app.post("/mc/reply", async (req, res) => {
       return res.json({ reply: "¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante." });
     }
 
+    // ✅ (tu lógica existente) aceptar nombres raros en paso "redes"
+    if (mem.pending === "redes" && !mem.redes) {
+      if (looksLikeLinkOrHandle(userText) || looksLikeBusinessName(userText)) {
+        mem.redes = userText;
+        mem.pending = inferPending(mem);
+      }
+    }
+
     // 2) armar mensajes
     const sys = buildSystemPrompt();
 
@@ -457,16 +472,37 @@ app.post("/mc/reply", async (req, res) => {
       response_format: { type: "json_object" },
     });
 
-    const raw = completion.choices?.[0]?.message?.content || "{}";
+    const raw = completion.choices?.[0]?.message?.content || "";
+    let parsed = safeParseModelJson(raw);
 
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (e) {
-      console.error("[/mc/reply] JSON parse fail:", raw);
-      return res.json({
-        reply: "Se me fue la señal un momentito 😅 ¿Me repites eso en una línea, porfa?",
+    // ✅ NUEVO: si viene roto, reintenta 1 vez “reparando” JSON
+    if (!parsed) {
+      console.error("[/mc/reply] JSON parse fail (raw):", raw);
+
+      const repair = await openai.chat.completions.create({
+        model: MODEL,
+        temperature: 0,
+        max_tokens: 260,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "Convierte el contenido del usuario en UN SOLO objeto JSON válido con el esquema: {reply:string, state:{sector,servicio,redes,objetivo,cerrado:boolean,cierre_enviado:boolean,pending}}. Sin texto extra.",
+          },
+          { role: "user", content: raw || "Responde con JSON válido siguiendo el esquema." },
+        ],
       });
+
+      const raw2 = repair.choices?.[0]?.message?.content || "";
+      parsed = safeParseModelJson(raw2);
+
+      if (!parsed) {
+        console.error("[/mc/reply] JSON parse fail (repair raw):", raw2);
+        return res.json({
+          reply: "Se me fue la señal un momentito 😅 ¿Me repites eso en una línea, porfa?",
+        });
+      }
     }
 
     const reply = safeText(parsed.reply) || "¿Me repites eso en una línea, porfa? 😊";
@@ -476,15 +512,12 @@ app.post("/mc/reply", async (req, res) => {
     mem.sector = safeText(newState.sector) || mem.sector;
     mem.servicio = safeText(newState.servicio) || mem.servicio;
     mem.redes = safeText(newState.redes) || mem.redes;
-
-    // objetivo se mantiene por compatibilidad; lo puede setear el modelo a "calificado"
     mem.objetivo = safeText(newState.objetivo) || mem.objetivo;
 
     mem.cerrado = typeof newState.cerrado === "boolean" ? newState.cerrado : mem.cerrado;
     mem.cierre_enviado =
       typeof newState.cierre_enviado === "boolean" ? newState.cierre_enviado : mem.cierre_enviado;
 
-    // recalcular pending determinista (3 preguntas)
     mem.pending = inferPending(mem);
 
     // 5) historial
