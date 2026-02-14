@@ -17,6 +17,12 @@ const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const REDIS_URL_RAW = process.env.REDIS_URL || "";
 const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1";
 
+// ✅ NUEVO (WhatsApp Cloud API Notify)
+const WA_TOKEN = process.env.WA_TOKEN || "";
+const WA_PHONE_NUMBER_ID =
+  process.env.WA_PHONE_NUMBER_ID || process.env.PHONE_NUMBER_ID || "";
+const ADMIN_PHONE = process.env.ADMIN_PHONE || "";
+
 // --- Helpers ---
 function safeText(x) {
   return String(x ?? "").trim();
@@ -179,7 +185,9 @@ function getAudioUrl(body) {
   const a1 = body.attachments?.[0]?.url || body.attachments?.[0]?.payload?.url;
   if (a1) return safeText(a1);
 
-  const a2 = body.message?.attachments?.[0]?.url || body.message?.attachments?.[0]?.payload?.url;
+  const a2 =
+    body.message?.attachments?.[0]?.url ||
+    body.message?.attachments?.[0]?.payload?.url;
   if (a2) return safeText(a2);
 
   const fcd = body.full_contact_data;
@@ -236,12 +244,16 @@ async function transcribeAudioFromUrl(url, openaiClient) {
       fs.unlink(tmpPath, () => {});
     }
   } catch (err) {
-    console.error("[transcribe] ERROR:", err?.response?.status, err?.message || err);
+    console.error(
+      "[transcribe] ERROR:",
+      err?.response?.status,
+      err?.message || err
+    );
     return "";
   }
 }
 
-// ✅ NUEVO: parser robusto para JSON del modelo
+// ✅ parser robusto para JSON del modelo
 function extractFirstJsonObject(raw) {
   const s = safeText(raw);
   if (!s) return "";
@@ -270,17 +282,73 @@ function safeParseModelJson(raw) {
   return null;
 }
 
+// ✅ NUEVO: WhatsApp Notify helpers
+function digitsOnly(x) {
+  return safeText(x).replace(/[^\d]/g, "");
+}
+
+function isLikelyPhoneDigits(x) {
+  const d = digitsOnly(x);
+  return d.length >= 9 && d.length <= 15;
+}
+
+function canSendAdminWhatsApp() {
+  return !!(WA_TOKEN && WA_PHONE_NUMBER_ID && ADMIN_PHONE);
+}
+
+function buildLeadMessage({ contactId, sector, servicio, redes }) {
+  const wa = isLikelyPhoneDigits(contactId) ? digitsOnly(contactId) : "";
+  const link = wa ? `https://wa.me/${wa}` : "";
+
+  return (
+    `🆕 Nuevo lead (Zia Bot)\n` +
+    `📌 Negocio: ${safeText(sector) || "-"}\n` +
+    `🤖 Automatizar: ${safeText(servicio) || "-"}\n` +
+    `📅 Citas/semana: ${safeText(redes) || "-"}\n` +
+    `👤 Cliente: ${wa || safeText(contactId) || "-"}\n` +
+    (link ? `🔗 ${link}\n` : "") +
+    `🕒 ${new Date().toISOString()}`
+  );
+}
+
+async function sendWhatsAppText(toDigits, text) {
+  const to = digitsOnly(toDigits);
+  if (!to) throw new Error("ADMIN_PHONE inválido");
+
+  const url = `https://graph.facebook.com/v20.0/${WA_PHONE_NUMBER_ID}/messages`;
+
+  await axios.post(
+    url,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 20000,
+    }
+  );
+}
+
 // --- Memory ---
 function defaultMemory() {
   return {
     sector: "",
     servicio: "",
-    redes: "", // aquí guardamos citas/semana (sin romper nombres)
-    objetivo: "", // se mantiene por compatibilidad
+    redes: "", // citas/semana
+    objetivo: "", // compat
     cerrado: false,
     cierre_enviado: false,
     pending: "sector",
     history: [],
+
+    // ✅ NUEVO: evitar notificar 2 veces
+    lead_notified: false,
   };
 }
 
@@ -288,7 +356,9 @@ function defaultMemory() {
 const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
 const redis = redisUrl
   ? new Redis(redisUrl, {
-      tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
+      tls: redisUrl.startsWith("rediss://")
+        ? { rejectUnauthorized: false }
+        : undefined,
       maxRetriesPerRequest: 2,
       enableReadyCheck: true,
     })
@@ -298,7 +368,12 @@ async function loadMemory(contactId) {
   if (!redis) return defaultMemory();
   const key = `zia:${contactId}`;
   const raw = await redis.get(key);
-  return raw ? JSON.parse(raw) : defaultMemory();
+  const mem = raw ? JSON.parse(raw) : defaultMemory();
+
+  // compat con memorias viejas
+  if (typeof mem.lead_notified !== "boolean") mem.lead_notified = false;
+
+  return mem;
 }
 
 async function saveMemory(contactId, mem) {
@@ -400,7 +475,7 @@ app.post("/mc/reply", async (req, res) => {
       return res.json({ reply: "¿Me confirmas tu mensaje otra vez, porfa? 😊" });
     }
 
-    // ✅ Si user_text es link de audio (.ogg) o viene vacío pero hay audio en otros campos -> transcribir
+    // ✅ audio -> transcribir
     let audioUrl = "";
     if (looksLikeAudioUrl(userText)) {
       audioUrl = userText;
@@ -475,7 +550,7 @@ app.post("/mc/reply", async (req, res) => {
     const raw = completion.choices?.[0]?.message?.content || "";
     let parsed = safeParseModelJson(raw);
 
-    // ✅ NUEVO: si viene roto, reintenta 1 vez “reparando” JSON
+    // ✅ si viene roto, reintenta 1 vez “reparando” JSON
     if (!parsed) {
       console.error("[/mc/reply] JSON parse fail (raw):", raw);
 
@@ -527,6 +602,33 @@ app.post("/mc/reply", async (req, res) => {
     );
 
     await saveMemory(contactId, mem);
+
+    // ✅ NUEVO: Notificar a tu WhatsApp cuando el lead esté completo (solo 1 vez)
+    const leadComplete = !!(mem.sector && mem.servicio && mem.redes && mem.cierre_enviado);
+    if (leadComplete && !mem.lead_notified) {
+      mem.lead_notified = true; // evita duplicados aunque falle el envío
+      await saveMemory(contactId, mem);
+
+      if (canSendAdminWhatsApp()) {
+        const msg = buildLeadMessage({
+          contactId,
+          sector: mem.sector,
+          servicio: mem.servicio,
+          redes: mem.redes,
+        });
+
+        try {
+          await sendWhatsAppText(ADMIN_PHONE, msg);
+          console.log("[lead_notify] sent to admin ✅");
+        } catch (e) {
+          console.error("[lead_notify] FAILED:", e?.response?.status, e?.message || e);
+        }
+      } else {
+        console.log(
+          "[lead_notify] skipped (missing WA_TOKEN/WA_PHONE_NUMBER_ID/ADMIN_PHONE)"
+        );
+      }
+    }
 
     console.log("[/mc/reply] done in", Date.now() - started, "ms");
     return res.json({ reply });
