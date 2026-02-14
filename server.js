@@ -22,6 +22,11 @@ const MANYCHAT_API_KEY = process.env.MANYCHAT_API_KEY || "";
 const ADMIN_SUBSCRIBER_ID = process.env.ADMIN_SUBSCRIBER_ID || "";
 const MANYCHAT_API_BASE = process.env.MANYCHAT_API_BASE || "https://api.manychat.com";
 
+// ✅ (Opcional) Fallback a Meta WhatsApp Cloud API
+const WA_TOKEN = process.env.WA_TOKEN || "";
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || "";
+const ADMIN_PHONE = process.env.ADMIN_PHONE || "";
+
 // --- Helpers ---
 function safeText(x) {
   return String(x ?? "").trim();
@@ -36,8 +41,6 @@ function mustAuth(req) {
 function normalizeRedisUrl(url) {
   const u = safeText(url);
   if (!u) return "";
-  // Upstash suele requerir TLS => rediss://
-  // Si te llegó redis:// lo convertimos a rediss://
   if (u.startsWith("redis://")) return "rediss://" + u.slice("redis://".length);
   return u;
 }
@@ -275,9 +278,13 @@ function safeParseModelJson(raw) {
   return null;
 }
 
-// ✅ ManyChat notify helpers
+// ✅ NUEVO: ManyChat notify helpers
 function canNotifyAdminViaManyChat() {
   return !!(MANYCHAT_API_KEY && ADMIN_SUBSCRIBER_ID);
+}
+
+function canNotifyAdminViaMeta() {
+  return !!(WA_TOKEN && PHONE_NUMBER_ID && ADMIN_PHONE);
 }
 
 function toDigits(x) {
@@ -299,9 +306,16 @@ function buildLeadSummary({ contactId, sector, servicio, redes }) {
   );
 }
 
-// ✅ NUEVO: request wrapper (para ver status y evitar throw automático)
-async function postManyChat(endpointPath, payload) {
-  const url = `${MANYCHAT_API_BASE}${endpointPath}`;
+function normalizeBaseUrl(base) {
+  const b = safeText(base);
+  if (!b) return "";
+  return b.endsWith("/") ? b.slice(0, -1) : b;
+}
+
+async function postManyChat(pathname, payload) {
+  const base = normalizeBaseUrl(MANYCHAT_API_BASE);
+  const url = `${base}${pathname}`;
+
   return axios.post(url, payload, {
     headers: {
       Authorization: `Bearer ${MANYCHAT_API_KEY}`,
@@ -309,79 +323,89 @@ async function postManyChat(endpointPath, payload) {
       Accept: "application/json",
     },
     timeout: 20000,
-    validateStatus: () => true,
+    validateStatus: () => true, // manejamos nosotros
   });
 }
 
-// ✅ NUEVO: enviar a tu WhatsApp (Admin) con fallback de endpoints (evita 404)
-async function sendAdminWhatsAppViaManyChat(text) {
-  const subscriberId = Number(ADMIN_SUBSCRIBER_ID);
-  const message = safeText(text);
+// ✅ NUEVO: intenta varios endpoints/payloads (porque ManyChat a veces cambia rutas por canal)
+async function sendAdminViaManyChat(text) {
+  const sid = Number(ADMIN_SUBSCRIBER_ID);
+  const msg = safeText(text);
 
-  const candidates = [
-    {
-      path: "/whatsapp/sending/sendText",
-      body: { subscriber_id: subscriberId, message },
-      label: "whatsapp/sendText",
-    },
-    {
-      path: "/whatsapp/sending/sendContent",
-      body: {
-        subscriber_id: subscriberId,
-        data: {
-          version: "v2",
-          content: {
-            messages: [{ type: "text", text: message }],
-          },
-        },
-      },
-      label: "whatsapp/sendContent(v2)",
-    },
-    {
-      path: "/wa/sending/sendText",
-      body: { subscriber_id: subscriberId, message },
-      label: "wa/sendText",
-    },
-    {
-      path: "/wa/sending/sendContent",
-      body: {
-        subscriber_id: subscriberId,
-        data: {
-          version: "v2",
-          content: {
-            messages: [{ type: "text", text: message }],
-          },
-        },
-      },
-      label: "wa/sendContent(v2)",
-    },
+  const tries = [
+    // WhatsApp (algunas cuentas lo tienen)
+    { path: "/whatsapp/sending/sendText", payload: { subscriber_id: sid, message: msg } },
+    { path: "/whatsapp/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
+
+    // Variantes "wa"
+    { path: "/wa/sending/sendText", payload: { subscriber_id: sid, message: msg } },
+    { path: "/wa/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
+
+    // "fb" (muy común en la API pública; muchas veces funciona cross-channel con subscriber_id)
+    { path: "/fb/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
+    { path: "/fb/sending/sendText", payload: { subscriber_id: sid, message: msg } },
+
+    // Algunas cuentas usan /sending directamente
+    { path: "/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
+    { path: "/sending/sendText", payload: { subscriber_id: sid, message: msg } },
   ];
 
   let lastErr = null;
 
-  for (const c of candidates) {
+  for (const t of tries) {
     try {
-      const resp = await postManyChat(c.path, c.body);
+      console.log(`[admin_notify] try ${t.path}`);
+      const resp = await postManyChat(t.path, t.payload);
 
       if (resp.status >= 200 && resp.status < 300) {
-        console.log(`[admin_notify] sent ✅ via ${c.label} (${resp.status})`);
+        console.log("[admin_notify] sent via ManyChat ✅", t.path);
         return true;
       }
 
-      const preview =
-        typeof resp.data === "string"
-          ? resp.data.slice(0, 120)
-          : JSON.stringify(resp.data || {}).slice(0, 240);
+      // ManyChat a veces devuelve JSON error; a veces HTML 404
+      console.log(
+        `[admin_notify] ${t.path} -> ${resp.status}`,
+        typeof resp.data === "string" ? resp.data.slice(0, 120) : resp.data
+      );
 
-      console.log(`[admin_notify] try ${c.label} -> ${resp.status} :: ${preview}`);
-      lastErr = new Error(`ManyChat ${c.label} failed with ${resp.status}`);
+      lastErr = new Error(`ManyChat ${t.path} -> ${resp.status}`);
     } catch (e) {
-      console.log(`[admin_notify] try ${c.label} -> ERROR`, e?.message || e);
       lastErr = e;
+      console.log("[admin_notify] fail", t.path, e?.response?.status || "", e?.message || e);
     }
   }
 
-  throw lastErr || new Error("ManyChat notify failed (no candidates worked)");
+  if (lastErr) throw lastErr;
+  throw new Error("ManyChat notify failed");
+}
+
+// ✅ (Opcional) fallback Meta Cloud API
+async function sendAdminViaMeta(text) {
+  const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
+  const body = safeText(text);
+
+  const resp = await axios.post(
+    url,
+    {
+      messaging_product: "whatsapp",
+      to: toDigits(ADMIN_PHONE),
+      type: "text",
+      text: { body },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 20000,
+      validateStatus: () => true,
+    }
+  );
+
+  if (resp.status >= 200 && resp.status < 300) return true;
+
+  console.log("[admin_notify][meta] ->", resp.status, resp.data);
+  throw new Error(`Meta send failed: ${resp.status}`);
 }
 
 // --- Memory ---
@@ -414,9 +438,7 @@ async function loadMemory(contactId) {
   const key = `zia:${contactId}`;
   const raw = await redis.get(key);
   const mem = raw ? JSON.parse(raw) : defaultMemory();
-
   if (typeof mem.admin_notified !== "boolean") mem.admin_notified = false;
-
   return mem;
 }
 
@@ -646,33 +668,44 @@ app.post("/mc/reply", async (req, res) => {
 
     await saveMemory(contactId, mem);
 
-    // ✅ cuando el lead está completo y ya cerró -> avisar a tu WhatsApp via ManyChat (1 vez)
+    // ✅ NUEVO: cuando el lead está completo y ya cerró -> avisar a tu WhatsApp (1 vez)
     const leadComplete = !!(mem.sector && mem.servicio && mem.redes && mem.cierre_enviado);
+
     if (leadComplete && !mem.admin_notified) {
       mem.admin_notified = true;
       await saveMemory(contactId, mem);
 
-      if (canNotifyAdminViaManyChat()) {
-        const summary = buildLeadSummary({
-          contactId,
-          sector: mem.sector,
-          servicio: mem.servicio,
-          redes: mem.redes,
-        });
+      const summary = buildLeadSummary({
+        contactId,
+        sector: mem.sector,
+        servicio: mem.servicio,
+        redes: mem.redes,
+      });
 
+      // 🔥 NO bloqueamos la respuesta al usuario
+      setImmediate(async () => {
         try {
-          await sendAdminWhatsAppViaManyChat(summary);
-          console.log("[admin_notify] sent ✅");
+          if (canNotifyAdminViaManyChat()) {
+            await sendAdminViaManyChat(summary);
+          } else if (canNotifyAdminViaMeta()) {
+            await sendAdminViaMeta(summary);
+            console.log("[admin_notify] sent via Meta ✅");
+          } else {
+            console.log("[admin_notify] skipped (missing MANYCHAT_API_KEY/ADMIN_SUBSCRIBER_ID and no Meta fallback)");
+          }
         } catch (e) {
-          console.error(
-            "[admin_notify] FAILED:",
-            e?.response?.status,
-            e?.response?.data || e?.message || e
-          );
+          console.error("[admin_notify] FAILED:", e?.response?.status, e?.response?.data || e?.message || e);
+          // si ManyChat falla, intenta Meta (si está configurado)
+          try {
+            if (canNotifyAdminViaMeta()) {
+              await sendAdminViaMeta(summary);
+              console.log("[admin_notify] fallback Meta ✅");
+            }
+          } catch (e2) {
+            console.error("[admin_notify] Meta fallback FAILED:", e2?.response?.status, e2?.response?.data || e2?.message || e2);
+          }
         }
-      } else {
-        console.log("[admin_notify] skipped (missing MANYCHAT_API_KEY/ADMIN_SUBSCRIBER_ID)");
-      }
+      });
     }
 
     console.log("[/mc/reply] done in", Date.now() - started, "ms");
