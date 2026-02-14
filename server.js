@@ -17,7 +17,7 @@ const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const REDIS_URL_RAW = process.env.REDIS_URL || "";
 const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1";
 
-// ✅ NUEVO: ManyChat Admin Notify (Opción A)
+// ✅ ManyChat Admin Notify (Opción A)
 const MANYCHAT_API_KEY = process.env.MANYCHAT_API_KEY || "";
 const ADMIN_SUBSCRIBER_ID = process.env.ADMIN_SUBSCRIBER_ID || "";
 const MANYCHAT_API_BASE = process.env.MANYCHAT_API_BASE || "https://api.manychat.com";
@@ -275,7 +275,7 @@ function safeParseModelJson(raw) {
   return null;
 }
 
-// ✅ NUEVO: ManyChat notify helpers
+// ✅ ManyChat notify helpers
 function canNotifyAdminViaManyChat() {
   return !!(MANYCHAT_API_KEY && ADMIN_SUBSCRIBER_ID);
 }
@@ -299,25 +299,89 @@ function buildLeadSummary({ contactId, sector, servicio, redes }) {
   );
 }
 
-// ⚠️ Endpoint típico de ManyChat para WhatsApp (si tu cuenta lo tiene habilitado)
-// Si te diera 404, te digo en 1 mensaje cuál endpoint alterno cambiar.
-async function sendAdminWhatsAppViaManyChat(text) {
-  const url = `${MANYCHAT_API_BASE}/whatsapp/sending/sendText`;
+// ✅ NUEVO: request wrapper (para ver status y evitar throw automático)
+async function postManyChat(endpointPath, payload) {
+  const url = `${MANYCHAT_API_BASE}${endpointPath}`;
+  return axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${MANYCHAT_API_KEY}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    timeout: 20000,
+    validateStatus: () => true,
+  });
+}
 
-  await axios.post(
-    url,
+// ✅ NUEVO: enviar a tu WhatsApp (Admin) con fallback de endpoints (evita 404)
+async function sendAdminWhatsAppViaManyChat(text) {
+  const subscriberId = Number(ADMIN_SUBSCRIBER_ID);
+  const message = safeText(text);
+
+  const candidates = [
     {
-      subscriber_id: Number(ADMIN_SUBSCRIBER_ID),
-      message: safeText(text),
+      path: "/whatsapp/sending/sendText",
+      body: { subscriber_id: subscriberId, message },
+      label: "whatsapp/sendText",
     },
     {
-      headers: {
-        Authorization: `Bearer ${MANYCHAT_API_KEY}`,
-        "Content-Type": "application/json",
+      path: "/whatsapp/sending/sendContent",
+      body: {
+        subscriber_id: subscriberId,
+        data: {
+          version: "v2",
+          content: {
+            messages: [{ type: "text", text: message }],
+          },
+        },
       },
-      timeout: 20000,
+      label: "whatsapp/sendContent(v2)",
+    },
+    {
+      path: "/wa/sending/sendText",
+      body: { subscriber_id: subscriberId, message },
+      label: "wa/sendText",
+    },
+    {
+      path: "/wa/sending/sendContent",
+      body: {
+        subscriber_id: subscriberId,
+        data: {
+          version: "v2",
+          content: {
+            messages: [{ type: "text", text: message }],
+          },
+        },
+      },
+      label: "wa/sendContent(v2)",
+    },
+  ];
+
+  let lastErr = null;
+
+  for (const c of candidates) {
+    try {
+      const resp = await postManyChat(c.path, c.body);
+
+      if (resp.status >= 200 && resp.status < 300) {
+        console.log(`[admin_notify] sent ✅ via ${c.label} (${resp.status})`);
+        return true;
+      }
+
+      const preview =
+        typeof resp.data === "string"
+          ? resp.data.slice(0, 120)
+          : JSON.stringify(resp.data || {}).slice(0, 240);
+
+      console.log(`[admin_notify] try ${c.label} -> ${resp.status} :: ${preview}`);
+      lastErr = new Error(`ManyChat ${c.label} failed with ${resp.status}`);
+    } catch (e) {
+      console.log(`[admin_notify] try ${c.label} -> ERROR`, e?.message || e);
+      lastErr = e;
     }
-  );
+  }
+
+  throw lastErr || new Error("ManyChat notify failed (no candidates worked)");
 }
 
 // --- Memory ---
@@ -331,9 +395,7 @@ function defaultMemory() {
     cierre_enviado: false,
     pending: "sector",
     history: [],
-
-    // ✅ NUEVO: evitar enviar el aviso 2 veces
-    admin_notified: false,
+    admin_notified: false, // ✅ evitar enviar el aviso 2 veces
   };
 }
 
@@ -584,7 +646,7 @@ app.post("/mc/reply", async (req, res) => {
 
     await saveMemory(contactId, mem);
 
-    // ✅ NUEVO: cuando el lead está completo y ya cerró -> avisar a tu WhatsApp via ManyChat (1 vez)
+    // ✅ cuando el lead está completo y ya cerró -> avisar a tu WhatsApp via ManyChat (1 vez)
     const leadComplete = !!(mem.sector && mem.servicio && mem.redes && mem.cierre_enviado);
     if (leadComplete && !mem.admin_notified) {
       mem.admin_notified = true;
@@ -602,7 +664,11 @@ app.post("/mc/reply", async (req, res) => {
           await sendAdminWhatsAppViaManyChat(summary);
           console.log("[admin_notify] sent ✅");
         } catch (e) {
-          console.error("[admin_notify] FAILED:", e?.response?.status, e?.response?.data || e?.message || e);
+          console.error(
+            "[admin_notify] FAILED:",
+            e?.response?.status,
+            e?.response?.data || e?.message || e
+          );
         }
       } else {
         console.log("[admin_notify] skipped (missing MANYCHAT_API_KEY/ADMIN_SUBSCRIBER_ID)");
