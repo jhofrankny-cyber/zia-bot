@@ -1,6 +1,10 @@
 const express = require("express");
 const Redis = require("ioredis");
 const OpenAI = require("openai");
+const axios = require("axios");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -11,6 +15,7 @@ const MC_AUTH_TOKEN = process.env.MC_AUTH_TOKEN || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const REDIS_URL_RAW = process.env.REDIS_URL || "";
+const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1";
 
 // --- Helpers ---
 function safeText(x) {
@@ -96,6 +101,84 @@ function looksLikeBusinessName(t) {
   return true;
 }
 
+// ✅ NUEVO: detectar URL de audio en payload (soporta varios nombres comunes)
+function getAudioUrl(body) {
+  if (!body || typeof body !== "object") return "";
+
+  const direct =
+    body.voice_url ||
+    body.audio_url ||
+    body.media_url ||
+    body.attachment_url ||
+    body.file_url ||
+    body.voice ||
+    body.audio ||
+    "";
+
+  if (direct) return safeText(direct);
+
+  // Por si viene en arrays/objetos
+  const a1 = body.attachments?.[0]?.url || body.attachments?.[0]?.payload?.url;
+  if (a1) return safeText(a1);
+
+  const a2 = body.message?.attachments?.[0]?.url || body.message?.attachments?.[0]?.payload?.url;
+  if (a2) return safeText(a2);
+
+  return "";
+}
+
+function extFromContentType(ct) {
+  const c = safeText(ct).toLowerCase();
+  if (c.includes("audio/ogg")) return "ogg";
+  if (c.includes("audio/opus")) return "ogg";
+  if (c.includes("audio/mpeg")) return "mp3";
+  if (c.includes("audio/mp3")) return "mp3";
+  if (c.includes("audio/mp4")) return "m4a";
+  if (c.includes("audio/x-m4a")) return "m4a";
+  if (c.includes("audio/wav")) return "wav";
+  if (c.includes("audio/webm")) return "webm";
+  return "ogg"; // default safe para WhatsApp (ogg/opus)
+}
+
+// ✅ NUEVO: transcribir audio desde URL (nota de voz)
+async function transcribeAudioFromUrl(url, openaiClient) {
+  const u = safeText(url);
+  if (!u) return "";
+
+  try {
+    const resp = await axios.get(u, {
+      responseType: "arraybuffer",
+      maxRedirects: 5,
+      timeout: 20000,
+      headers: {
+        // algunos hosts piden user-agent
+        "User-Agent": "Mozilla/5.0",
+      },
+    });
+
+    const ct = resp.headers?.["content-type"] || "";
+    const ext = extFromContentType(ct);
+
+    const tmpPath = path.join(os.tmpdir(), `zia-voice-${Date.now()}.${ext}`);
+    fs.writeFileSync(tmpPath, Buffer.from(resp.data));
+
+    try {
+      const transcription = await openaiClient.audio.transcriptions.create({
+        file: fs.createReadStream(tmpPath),
+        model: TRANSCRIBE_MODEL,
+        language: "es",
+      });
+
+      return safeText(transcription?.text);
+    } finally {
+      fs.unlink(tmpPath, () => {});
+    }
+  } catch (err) {
+    console.error("[transcribe] ERROR:", err?.response?.status, err?.message || err);
+    return "";
+  }
+}
+
 // --- Memory ---
 function defaultMemory() {
   return {
@@ -119,9 +202,7 @@ const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
 const redis = redisUrl
   ? new Redis(redisUrl, {
       // Upstash/Redis TLS: en algunos entornos ayuda esto
-      tls: redisUrl.startsWith("rediss://")
-        ? { rejectUnauthorized: false }
-        : undefined,
+      tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
       maxRetriesPerRequest: 2,
       enableReadyCheck: true,
     })
@@ -169,6 +250,10 @@ PREGUNTAS (en este orden, SIN botones; incluye ejemplos en el mismo mensaje)
 
 3) (redes) Volumen semanal:
    “Aprox. ¿cuántas citas manejan por semana? Ejemplos: 5, 15, 30, 60+.”
+
+✅ REGLA PARA MENSAJES LARGOS / AUDIO TRANSCRITO (MUY IMPORTANTE)
+- Si el usuario responde varias cosas en un mismo mensaje (incluyendo audio transcrito), extrae y guarda TODO lo que puedas para: sector, servicio y redes.
+- Si ya tienes las 3 respuestas, NO preguntes más: cierra.
 
 ✅ REGLA PARA RESPUESTAS CORTAS (MUY IMPORTANTE)
 - Cuando estés en el paso "redes" (pending = redes), acepta como válido números o rangos aunque sean cortos: "5", "15", "30", "60+", "más de 60".
@@ -236,7 +321,7 @@ app.post("/mc/reply", async (req, res) => {
     }
 
     const contactId = safeText(req.body?.contact_id);
-    const userText = safeText(req.body?.user_text);
+    let userText = safeText(req.body?.user_text);
 
     console.log("[/mc/reply] contact_id:", contactId || "(missing)");
     console.log("[/mc/reply] user_text:", userText ? `"${userText}"` : "(empty)");
@@ -244,8 +329,24 @@ app.post("/mc/reply", async (req, res) => {
     if (!contactId) {
       return res.json({ reply: "¿Me confirmas tu mensaje otra vez, porfa? 😊" });
     }
+
+    // ✅ NUEVO: si viene nota de voz (y user_text vacío), transcribimos
     if (!userText) {
-      return res.json({ reply: "Se me quedó el mensaje en blanco 😅 ¿Me lo repites en una línea?" });
+      const audioUrl = getAudioUrl(req.body);
+      if (audioUrl) {
+        console.log("[/mc/reply] audio_url detected:", audioUrl);
+        const transcript = await transcribeAudioFromUrl(audioUrl, openai);
+        if (transcript) {
+          userText = transcript;
+          console.log("[/mc/reply] transcript:", `"${userText}"`);
+        } else {
+          return res.json({
+            reply: "No pude escuchar bien la nota de voz 😅 ¿Me lo puedes mandar en texto o reenviar el audio más claro?",
+          });
+        }
+      } else {
+        return res.json({ reply: "Se me quedó el mensaje en blanco 😅 ¿Me lo repites en una línea?" });
+      }
     }
 
     // 1) cargar memoria
@@ -262,7 +363,7 @@ app.post("/mc/reply", async (req, res) => {
       if (looksLikeLinkOrHandle(userText) || looksLikeBusinessName(userText)) {
         mem.redes = userText; // guardar tal cual
         mem.pending = inferPending(mem);
-        // no retornamos todavía: dejamos que el modelo pregunte objetivo con el estado ya actualizado
+        // no retornamos todavía: dejamos que el modelo pregunte lo siguiente con el estado ya actualizado
       }
     }
 
