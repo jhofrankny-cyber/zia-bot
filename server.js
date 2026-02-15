@@ -486,7 +486,7 @@ TAREA
 - Usa el estado recibido (sector/servicio/redes/objetivo/cerrado/cierre_enviado/pending).
 - Pregunta SOLO 1 cosa siguiendo el orden sector -> servicio -> redes.
 - Cuando ya tengas las 3, responde EXACTO:
-  “¡Listo! Ya quedó registrado 🙌 te escribe un representante.”
+  “¡Listo! Ya quedó registrado 🙌 un representante de Zia Lab te estará contactando para presentarte la propuesta con el 30% OFF por los primeros 3 meses 🚀”
   y marca cerrado=true, cierre_enviado=true y objetivo="calificado".
 
 SALIDA OBLIGATORIA:
