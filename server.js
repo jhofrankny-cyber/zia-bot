@@ -202,7 +202,9 @@ function getAudioUrl(body) {
   const a1 = body.attachments?.[0]?.url || body.attachments?.[0]?.payload?.url;
   if (a1) return safeText(a1);
 
-  const a2 = body.message?.attachments?.[0]?.url || body.message?.attachments?.[0]?.payload?.url;
+  const a2 =
+    body.message?.attachments?.[0]?.url ||
+    body.message?.attachments?.[0]?.payload?.url;
   if (a2) return safeText(a2);
 
   const fcd = body.full_contact_data;
@@ -349,19 +351,15 @@ async function sendAdminViaManyChat(text) {
   const msg = safeText(text);
 
   const tries = [
-    // WhatsApp (algunas cuentas lo tienen)
     { path: "/whatsapp/sending/sendText", payload: { subscriber_id: sid, message: msg } },
     { path: "/whatsapp/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
 
-    // Variantes "wa"
     { path: "/wa/sending/sendText", payload: { subscriber_id: sid, message: msg } },
     { path: "/wa/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
 
-    // "fb" (muy común en la API pública; muchas veces funciona cross-channel con subscriber_id)
     { path: "/fb/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
     { path: "/fb/sending/sendText", payload: { subscriber_id: sid, message: msg } },
 
-    // Algunas cuentas usan /sending directamente
     { path: "/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
     { path: "/sending/sendText", payload: { subscriber_id: sid, message: msg } },
   ];
@@ -486,8 +484,8 @@ function defaultMemory() {
     cierre_enviado: false,
     pending: "sector",
     history: [],
-    admin_notified: false, // ✅ evitar enviar el aviso 2 veces
-    inbound_count: 0, // ✅ NUEVO: contador de mensajes del usuario
+    admin_notified: false,
+    inbound_count: 0,
     followup: {
       active: false,
       started_ts: 0,
@@ -497,7 +495,7 @@ function defaultMemory() {
       cancelled: false,
       cancel_reason: "",
       cancelled_ts: 0,
-    }, // ✅ NUEVO: estado follow-up
+    },
   };
 }
 
@@ -518,7 +516,6 @@ async function loadMemory(contactId) {
   const mem = raw ? JSON.parse(raw) : defaultMemory();
   if (typeof mem.admin_notified !== "boolean") mem.admin_notified = false;
 
-  // ✅ NUEVO: compat fields
   if (typeof mem.inbound_count !== "number") mem.inbound_count = 0;
   if (!mem.followup || typeof mem.followup !== "object") {
     mem.followup = defaultMemory().followup;
@@ -542,16 +539,13 @@ async function saveMemory(contactId, mem) {
   await redis.set(key, JSON.stringify(mem), "EX", 60 * 60 * 24 * 7);
 }
 
-// ✅ NUEVO: follow-up scheduler (Redis ZSET)
+// ✅ follow-up scheduler (Redis ZSET)
 async function scheduleFollowupTick(contactId, mem) {
   if (!redis) return;
   const now = Date.now();
 
-  // Solo si es el primer mensaje y todavía no cerró
   if ((mem.inbound_count || 0) !== 1) return;
   if (mem.cierre_enviado) return;
-
-  // Si ya tiene followup activo, no duplicar
   if (mem.followup?.active === true) return;
 
   mem.followup.active = true;
@@ -561,13 +555,9 @@ async function scheduleFollowupTick(contactId, mem) {
   mem.followup.started_ts = mem.followup.started_ts || now;
   mem.followup.last_sent_ts = mem.followup.last_sent_ts || 0;
   mem.followup.count = mem.followup.count || 0;
-
-  // Primer envío 4h después del primer mensaje
   mem.followup.next_due_ts = mem.followup.next_due_ts || now + FOLLOWUP_INTERVAL_MS;
 
   await saveMemory(contactId, mem);
-
-  // ZADD score=next_due_ts member=contactId
   await redis.zadd(FOLLOWUP_ZSET_KEY, String(mem.followup.next_due_ts), String(contactId));
 }
 
@@ -634,7 +624,6 @@ async function processDueFollowupsTick(limit = FOLLOWUP_BATCH_LIMIT) {
         continue;
       }
 
-      // ✅ (ACTUALIZADO) recordatorio alineado a nueva pregunta #1
       const reminderText =
         "👋✨ Solo paso por aquí rapidito…\n" +
         "¿Qué necesitas ahora mismo?\n" +
@@ -670,7 +659,6 @@ async function processDueFollowupsTick(limit = FOLLOWUP_BATCH_LIMIT) {
 
       mem.followup.next_due_ts = Date.now() + FOLLOWUP_INTERVAL_MS;
       await saveMemory(contactId, mem);
-
       await redis.zadd(FOLLOWUP_ZSET_KEY, String(mem.followup.next_due_ts), String(contactId));
     } catch (e) {
       console.error("❌ processDueFollowupsTick item error:", e?.response?.data || e?.message || e);
@@ -685,10 +673,7 @@ async function processDueFollowupsTick(limit = FOLLOWUP_BATCH_LIMIT) {
 // --- OpenAI ---
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ✅ (ACTUALIZADO) prompt: mismas llaves sector/servicio/redes pero nueva lógica
-// sector = (web | bot | ambos)
-// servicio = detalle según elección (tipo de web / tipo de bot / prioridad si ambos)
-// redes = nombre del negocio o @Instagram
+// ✅ PROMPT ajustado: entiende números + maneja “precio/preguntas raras” redirigiendo sin romper el flujo
 function buildSystemPrompt() {
   return `
 Eres Zia Bot, el asistente comercial de Zia Lab Agency. Hablas como una persona real, cercana y profesional, con tono relajado-formal en español natural (RD si aplica).
@@ -712,6 +697,24 @@ IMPORTANTE (MAPEO DE CAMPOS)
 - Guarda la RESPUESTA de la pregunta #2 en: state.servicio
 - Guarda la RESPUESTA de la pregunta #3 (nombre/IG) en: state.redes
 
+NORMALIZACIÓN (SÚPER IMPORTANTE)
+- Si el usuario responde con número:
+  - “1” = “Página web”
+  - “2” = “Bot para WhatsApp”
+  - “3” = “Ambos”
+  Guarda el valor normalizado en state.sector.
+- También acepta: “web”, “pagina”, “página”, “landing”, “corporativa” como Página web.
+- Acepta: “bot”, “whatsapp”, “automatizar”, “citas”, “ventas” como Bot para WhatsApp.
+- Acepta: “ambos”, “los dos”, “2 servicios” como Ambos.
+
+MANEJO DE MENSAJES “RAROS” / FUERA DE FLUJO (PRECIO, TIEMPO, GARANTÍA, ETC)
+- Si el usuario pregunta precio, tiempo, “cuánto cuesta”, “planes”, “promo”, o algo que NO responde la pregunta pendiente:
+  1) Responde amable: “Te explico eso en un momentito 😊”
+  2) Dile que para enviarlo correcto necesita 3 respuestas rápidas
+  3) Repite EXACTAMENTE la pregunta que toca según pending
+  4) MUY IMPORTANTE: NO inventes respuestas, NO avances estado si no respondió.
+  (En ese caso, mantén state igual y pending igual.)
+
 PREGUNTAS (en este orden, SIN botones; incluye opciones en el mismo mensaje)
 1) (sector) ¿Qué necesitas ahora mismo?
 “1) Página web 🚀  2) Bot para WhatsApp 🤖  3) Ambos 🔥”
@@ -730,7 +733,6 @@ PREGUNTAS (en este orden, SIN botones; incluye opciones en el mismo mensaje)
 REGLAS IMPORTANTES
 - Si el usuario responde varias cosas en un mismo mensaje (incluyendo audio transcrito), extrae y guarda TODO lo que puedas para: sector, servicio y redes.
 - Si ya tienes las 3 respuestas (sector + servicio + redes), NO preguntes más: cierra.
-- Acepta respuestas cortas tipo “1”, “2”, “3”, “ambos”, “pagina”, “bot”, etc. Normaliza si puedes.
 
 CIERRE (cuando ya tengas las 3):
 Responde EXACTO:
@@ -877,7 +879,6 @@ app.post("/mc/reply", async (req, res) => {
     const raw = completion.choices?.[0]?.message?.content || "";
     let parsed = safeParseModelJson(raw);
 
-    // ✅ si viene roto, reintenta 1 vez “reparando” JSON
     if (!parsed) {
       console.error("[/mc/reply] JSON parse fail (raw):", raw);
 
@@ -949,7 +950,6 @@ app.post("/mc/reply", async (req, res) => {
         redes: mem.redes,
       });
 
-      // 🔥 NO bloqueamos la respuesta al usuario
       setImmediate(async () => {
         try {
           if (canNotifyAdminViaManyChat()) {
