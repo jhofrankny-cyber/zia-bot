@@ -27,6 +27,21 @@ const WA_TOKEN = process.env.WA_TOKEN || "";
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || "";
 const ADMIN_PHONE = process.env.ADMIN_PHONE || "";
 
+// =============================
+// ✅ TICK / FOLLOW-UPS (NUEVO)
+// - Cada 4 horas por 24h (máx 6)
+// - Solo si fue el primer mensaje (inbound_count === 1)
+// - Si escribe 2do mensaje o ya cerró (cierre_enviado) => cancelar
+// - Se guarda en Redis (ZSET + mem) y se procesa con /tick
+// =============================
+const TICK_TOKEN = process.env.TICK_TOKEN || "";
+
+const FOLLOWUP_ZSET_KEY = "zia:followup:due";
+const FOLLOWUP_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4h
+const FOLLOWUP_MAX_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h
+const FOLLOWUP_MAX_COUNT = 6;
+const FOLLOWUP_BATCH_LIMIT = 25;
+
 // --- Helpers ---
 function safeText(x) {
   return String(x ?? "").trim();
@@ -291,15 +306,16 @@ function toDigits(x) {
   return safeText(x).replace(/[^\d]/g, "");
 }
 
+// ✅ (ACTUALIZADO TEXTO) - ahora resume según nueva lógica (sin cambiar campos)
 function buildLeadSummary({ contactId, sector, servicio, redes }) {
   const waDigits = toDigits(contactId);
   const waLink = waDigits ? `https://wa.me/${waDigits}` : "";
 
   return (
     `🆕 Nuevo lead (Zia Bot)\n` +
-    `📌 Negocio: ${safeText(sector) || "-"}\n` +
-    `🤖 Automatizar: ${safeText(servicio) || "-"}\n` +
-    `📅 Citas/semana: ${safeText(redes) || "-"}\n` +
+    `🧩 Necesita: ${safeText(sector) || "-"}\n` +
+    `📌 Detalle: ${safeText(servicio) || "-"}\n` +
+    `📲 Negocio/IG: ${safeText(redes) || "-"}\n` +
     `👤 WhatsApp: ${waDigits || safeText(contactId) || "-"}\n` +
     (waLink ? `🔗 ${waLink}\n` : "") +
     `🕒 ${new Date().toLocaleString()}`
@@ -362,7 +378,6 @@ async function sendAdminViaManyChat(text) {
         return true;
       }
 
-      // ManyChat a veces devuelve JSON error; a veces HTML 404
       console.log(
         `[admin_notify] ${t.path} -> ${resp.status}`,
         typeof resp.data === "string" ? resp.data.slice(0, 120) : resp.data
@@ -377,6 +392,58 @@ async function sendAdminViaManyChat(text) {
 
   if (lastErr) throw lastErr;
   throw new Error("ManyChat notify failed");
+}
+
+// ✅ NUEVO: enviar follow-up al usuario (ManyChat) usando contactId como subscriber_id
+function canSendUserFollowupViaManyChat() {
+  return !!MANYCHAT_API_KEY;
+}
+
+async function sendUserFollowupViaManyChat(contactId, text) {
+  const sid = Number(toDigits(contactId) || contactId);
+  const msg = safeText(text);
+  if (!sid || !msg) return false;
+
+  const tries = [
+    { path: "/whatsapp/sending/sendText", payload: { subscriber_id: sid, message: msg } },
+    { path: "/whatsapp/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
+
+    { path: "/wa/sending/sendText", payload: { subscriber_id: sid, message: msg } },
+    { path: "/wa/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
+
+    { path: "/fb/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
+    { path: "/fb/sending/sendText", payload: { subscriber_id: sid, message: msg } },
+
+    { path: "/sending/sendContent", payload: { subscriber_id: sid, message: msg } },
+    { path: "/sending/sendText", payload: { subscriber_id: sid, message: msg } },
+  ];
+
+  let lastErr = null;
+
+  for (const t of tries) {
+    try {
+      console.log(`[followup_user] try ${t.path} -> subscriber_id=${sid}`);
+      const resp = await postManyChat(t.path, t.payload);
+
+      if (resp.status >= 200 && resp.status < 300) {
+        console.log("[followup_user] sent ✅", t.path);
+        return true;
+      }
+
+      console.log(
+        `[followup_user] ${t.path} -> ${resp.status}`,
+        typeof resp.data === "string" ? resp.data.slice(0, 120) : resp.data
+      );
+
+      lastErr = new Error(`ManyChat ${t.path} -> ${resp.status}`);
+    } catch (e) {
+      lastErr = e;
+      console.log("[followup_user] fail", t.path, e?.response?.status || "", e?.message || e);
+    }
+  }
+
+  if (lastErr) throw lastErr;
+  throw new Error("ManyChat followup failed");
 }
 
 // ✅ (Opcional) fallback Meta Cloud API
@@ -420,6 +487,17 @@ function defaultMemory() {
     pending: "sector",
     history: [],
     admin_notified: false, // ✅ evitar enviar el aviso 2 veces
+    inbound_count: 0, // ✅ NUEVO: contador de mensajes del usuario
+    followup: {
+      active: false,
+      started_ts: 0,
+      last_sent_ts: 0,
+      next_due_ts: 0,
+      count: 0,
+      cancelled: false,
+      cancel_reason: "",
+      cancelled_ts: 0,
+    }, // ✅ NUEVO: estado follow-up
   };
 }
 
@@ -439,6 +517,22 @@ async function loadMemory(contactId) {
   const raw = await redis.get(key);
   const mem = raw ? JSON.parse(raw) : defaultMemory();
   if (typeof mem.admin_notified !== "boolean") mem.admin_notified = false;
+
+  // ✅ NUEVO: compat fields
+  if (typeof mem.inbound_count !== "number") mem.inbound_count = 0;
+  if (!mem.followup || typeof mem.followup !== "object") {
+    mem.followup = defaultMemory().followup;
+  } else {
+    if (typeof mem.followup.active !== "boolean") mem.followup.active = false;
+    if (typeof mem.followup.started_ts !== "number") mem.followup.started_ts = 0;
+    if (typeof mem.followup.last_sent_ts !== "number") mem.followup.last_sent_ts = 0;
+    if (typeof mem.followup.next_due_ts !== "number") mem.followup.next_due_ts = 0;
+    if (typeof mem.followup.count !== "number") mem.followup.count = 0;
+    if (typeof mem.followup.cancelled !== "boolean") mem.followup.cancelled = false;
+    if (typeof mem.followup.cancel_reason !== "string") mem.followup.cancel_reason = "";
+    if (typeof mem.followup.cancelled_ts !== "number") mem.followup.cancelled_ts = 0;
+  }
+
   return mem;
 }
 
@@ -448,9 +542,153 @@ async function saveMemory(contactId, mem) {
   await redis.set(key, JSON.stringify(mem), "EX", 60 * 60 * 24 * 7);
 }
 
+// ✅ NUEVO: follow-up scheduler (Redis ZSET)
+async function scheduleFollowupTick(contactId, mem) {
+  if (!redis) return;
+  const now = Date.now();
+
+  // Solo si es el primer mensaje y todavía no cerró
+  if ((mem.inbound_count || 0) !== 1) return;
+  if (mem.cierre_enviado) return;
+
+  // Si ya tiene followup activo, no duplicar
+  if (mem.followup?.active === true) return;
+
+  mem.followup.active = true;
+  mem.followup.cancelled = false;
+  mem.followup.cancel_reason = "";
+  mem.followup.cancelled_ts = 0;
+  mem.followup.started_ts = mem.followup.started_ts || now;
+  mem.followup.last_sent_ts = mem.followup.last_sent_ts || 0;
+  mem.followup.count = mem.followup.count || 0;
+
+  // Primer envío 4h después del primer mensaje
+  mem.followup.next_due_ts = mem.followup.next_due_ts || now + FOLLOWUP_INTERVAL_MS;
+
+  await saveMemory(contactId, mem);
+
+  // ZADD score=next_due_ts member=contactId
+  await redis.zadd(FOLLOWUP_ZSET_KEY, String(mem.followup.next_due_ts), String(contactId));
+}
+
+async function cancelFollowupTick(contactId, mem, reason = "cancelled") {
+  if (!redis) return;
+
+  mem = mem || (await loadMemory(contactId));
+  if (!mem.followup || typeof mem.followup !== "object") mem.followup = defaultMemory().followup;
+
+  mem.followup.active = false;
+  mem.followup.cancelled = true;
+  mem.followup.cancel_reason = safeText(reason);
+  mem.followup.cancelled_ts = Date.now();
+  mem.followup.next_due_ts = 0;
+
+  await saveMemory(contactId, mem);
+  await redis.zrem(FOLLOWUP_ZSET_KEY, String(contactId));
+}
+
+async function processDueFollowupsTick(limit = FOLLOWUP_BATCH_LIMIT) {
+  if (!redis) return;
+
+  const now = Date.now();
+
+  const due = await redis.zrangebyscore(
+    FOLLOWUP_ZSET_KEY,
+    "-inf",
+    String(now),
+    "LIMIT",
+    0,
+    limit
+  );
+
+  if (!due || due.length === 0) return;
+
+  for (const contactId of due) {
+    try {
+      const mem = await loadMemory(contactId);
+
+      if (mem.cierre_enviado) {
+        await cancelFollowupTick(contactId, mem, "lead_closed");
+        continue;
+      }
+
+      if ((mem.inbound_count || 0) >= 2) {
+        await cancelFollowupTick(contactId, mem, "user_sent_second_message");
+        continue;
+      }
+
+      if (mem.followup?.active !== true) {
+        await redis.zrem(FOLLOWUP_ZSET_KEY, String(contactId));
+        continue;
+      }
+
+      const started = mem.followup.started_ts || now;
+
+      if (now - started > FOLLOWUP_MAX_WINDOW_MS) {
+        await cancelFollowupTick(contactId, mem, "window_expired");
+        continue;
+      }
+
+      if ((mem.followup.count || 0) >= FOLLOWUP_MAX_COUNT) {
+        await cancelFollowupTick(contactId, mem, "max_count_reached");
+        continue;
+      }
+
+      // ✅ (ACTUALIZADO) recordatorio alineado a nueva pregunta #1
+      const reminderText =
+        "👋✨ Solo paso por aquí rapidito…\n" +
+        "¿Qué necesitas ahora mismo?\n" +
+        "1) Página web 🚀\n" +
+        "2) Bot para WhatsApp 🤖\n" +
+        "3) Ambos 🔥";
+
+      try {
+        if (canSendUserFollowupViaManyChat()) {
+          await sendUserFollowupViaManyChat(contactId, reminderText);
+        } else {
+          console.log("[followup_user] skipped (missing MANYCHAT_API_KEY)");
+        }
+      } catch (e) {
+        console.error(
+          "[followup_user] FAILED:",
+          e?.response?.status,
+          e?.response?.data || e?.message || e
+        );
+        mem.followup.next_due_ts = Date.now() + 10 * 60 * 1000;
+        await saveMemory(contactId, mem);
+        await redis.zadd(FOLLOWUP_ZSET_KEY, String(mem.followup.next_due_ts), String(contactId));
+        continue;
+      }
+
+      mem.followup.last_sent_ts = now;
+      mem.followup.count = (mem.followup.count || 0) + 1;
+
+      if (mem.followup.count >= FOLLOWUP_MAX_COUNT) {
+        await cancelFollowupTick(contactId, mem, "max_count_reached");
+        continue;
+      }
+
+      mem.followup.next_due_ts = Date.now() + FOLLOWUP_INTERVAL_MS;
+      await saveMemory(contactId, mem);
+
+      await redis.zadd(FOLLOWUP_ZSET_KEY, String(mem.followup.next_due_ts), String(contactId));
+    } catch (e) {
+      console.error("❌ processDueFollowupsTick item error:", e?.response?.data || e?.message || e);
+      try {
+        const fallback = Date.now() + 10 * 60 * 1000;
+        await redis.zadd(FOLLOWUP_ZSET_KEY, String(fallback), String(contactId));
+      } catch (_) {}
+    }
+  }
+}
+
 // --- OpenAI ---
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
+// ✅ (ACTUALIZADO) prompt: mismas llaves sector/servicio/redes pero nueva lógica
+// sector = (web | bot | ambos)
+// servicio = detalle según elección (tipo de web / tipo de bot / prioridad si ambos)
+// redes = nombre del negocio o @Instagram
 function buildSystemPrompt() {
   return `
 Eres Zia Bot, el asistente comercial de Zia Lab Agency. Hablas como una persona real, cercana y profesional, con tono relajado-formal en español natural (RD si aplica).
@@ -465,29 +703,40 @@ REGLAS CLAVE
 - No inventes datos si el usuario no lo dijo.
 
 OBJETIVO
-Capturar el lead con SOLO 3 preguntas. No envíes demo, no hables de precios, no menciones descuentos.
+Capturar el lead con SOLO 3 preguntas para estos 2 servicios:
+1) Páginas web (landing, corporativa, menú/servicios, etc)
+2) Bots para WhatsApp (ventas, citas, agenda, etc)
 
-PREGUNTAS (en este orden, SIN botones; incluye ejemplos en el mismo mensaje)
-1) (sector) Tipo de negocio:
-“¿Qué tipo de negocio tienes? Ejemplos: clínica dental, spa, salón de belleza, consultorio, barbería, estudio, otro.”
+IMPORTANTE (MAPEO DE CAMPOS)
+- Guarda la RESPUESTA de la pregunta #1 en: state.sector
+- Guarda la RESPUESTA de la pregunta #2 en: state.servicio
+- Guarda la RESPUESTA de la pregunta #3 (nombre/IG) en: state.redes
 
-2) (servicio) Qué quiere automatizar primero:
-“¿Qué te gustaría automatizar primero en WhatsApp? Ejemplos: agendar citas, confirmar/recordatorios, reagendar, información y precios.”
+PREGUNTAS (en este orden, SIN botones; incluye opciones en el mismo mensaje)
+1) (sector) ¿Qué necesitas ahora mismo?
+“1) Página web 🚀  2) Bot para WhatsApp 🤖  3) Ambos 🔥”
 
-3) (redes) Volumen semanal (citas por semana):
-“Aprox. ¿cuántas citas manejan por semana? Ejemplos: 5, 15, 30, 60+.”
+2) (servicio) Pregunta dinámica según (sector):
+- Si elige “Página web”:
+  “¿Qué tipo de web necesitas: landing (1 página), corporativa, menú/delivery o tienda online?”
+- Si elige “Bot para WhatsApp”:
+  “¿Para qué lo quieres: ventas, agendar citas, responder precios/FAQ o todo automatizado?”
+- Si elige “Ambos”:
+  “Perfecto 🙌 ¿Qué quieres automatizar primero: las ventas por WhatsApp o la página web?”
+
+3) (redes) Cierre:
+“¿Cómo se llama tu negocio o pásame tu Instagram para revisarlo y prepararte el demo?”
 
 REGLAS IMPORTANTES
 - Si el usuario responde varias cosas en un mismo mensaje (incluyendo audio transcrito), extrae y guarda TODO lo que puedas para: sector, servicio y redes.
-- Si ya tienes las 3 respuestas, NO preguntes más: cierra.
-- En "redes" acepta números cortos: "5", "15", "30", "60+".
+- Si ya tienes las 3 respuestas (sector + servicio + redes), NO preguntes más: cierra.
+- Acepta respuestas cortas tipo “1”, “2”, “3”, “ambos”, “pagina”, “bot”, etc. Normaliza si puedes.
 
-TAREA
-- Usa el estado recibido (sector/servicio/redes/objetivo/cerrado/cierre_enviado/pending).
-- Pregunta SOLO 1 cosa siguiendo el orden sector -> servicio -> redes.
-- Cuando ya tengas las 3, responde EXACTO:
-  “¡Listo! Ya quedó registrado 🙌 un representante de Zia Lab te estará contactando para presentarte la propuesta con el 30% OFF por los primeros 3 meses 🚀”
-  y marca cerrado=true, cierre_enviado=true y objetivo="calificado".
+CIERRE (cuando ya tengas las 3):
+Responde EXACTO:
+“Perfecto 🙌 ya reviso tu negocio y te envío el demo con la propuesta del 30% OFF.”
+
+y marca: cerrado=true, cierre_enviado=true y objetivo="calificado".
 
 SALIDA OBLIGATORIA:
 Devuelve SOLO JSON válido (sin texto extra), con este formato:
@@ -570,12 +819,25 @@ app.post("/mc/reply", async (req, res) => {
     const mem = await loadMemory(contactId);
     mem.pending = inferPending(mem);
 
+    // ✅ contador inbound (para follow-ups)
+    mem.inbound_count = (mem.inbound_count || 0) + 1;
+
+    // ✅ si escribe 2do mensaje, cancelar recordatorios
+    if (mem.inbound_count >= 2) {
+      await cancelFollowupTick(contactId, mem, "user_sent_second_message");
+    }
+
+    // ✅ si es el primer mensaje, programar recordatorios
+    if (mem.inbound_count === 1) {
+      await scheduleFollowupTick(contactId, mem);
+    }
+
     // Si ya cerró y el usuario escribe ack -> respuesta corta
     if (mem.cierre_enviado && isAck(userText)) {
       return res.json({ reply: "¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante." });
     }
 
-    // ✅ aceptar nombres raros en paso "redes"
+    // ✅ aceptar nombres/handles en paso "redes"
     if (mem.pending === "redes" && !mem.redes) {
       if (looksLikeLinkOrHandle(userText) || looksLikeBusinessName(userText)) {
         mem.redes = userText;
@@ -668,7 +930,12 @@ app.post("/mc/reply", async (req, res) => {
 
     await saveMemory(contactId, mem);
 
-    // ✅ NUEVO: cuando el lead está completo y ya cerró -> avisar a tu WhatsApp (1 vez)
+    // ✅ si ya cerró el lead, cancelar recordatorios
+    if (mem.cierre_enviado) {
+      await cancelFollowupTick(contactId, mem, "lead_closed");
+    }
+
+    // ✅ cuando el lead está completo y ya cerró -> avisar a tu WhatsApp (1 vez)
     const leadComplete = !!(mem.sector && mem.servicio && mem.redes && mem.cierre_enviado);
 
     if (leadComplete && !mem.admin_notified) {
@@ -695,7 +962,6 @@ app.post("/mc/reply", async (req, res) => {
           }
         } catch (e) {
           console.error("[admin_notify] FAILED:", e?.response?.status, e?.response?.data || e?.message || e);
-          // si ManyChat falla, intenta Meta (si está configurado)
           try {
             if (canNotifyAdminViaMeta()) {
               await sendAdminViaMeta(summary);
@@ -716,6 +982,21 @@ app.post("/mc/reply", async (req, res) => {
   }
 });
 
+// ✅ /health (se mantiene)
 app.get("/health", (_req, res) => res.send("ok"));
+
+// ✅ /tick (NUEVO) - UptimeRobot pega aquí para procesar follow-ups
+app.get("/tick", async (req, res) => {
+  try {
+    const token = safeText(req.query?.token);
+    if (!TICK_TOKEN || token !== TICK_TOKEN) return res.sendStatus(403);
+
+    await processDueFollowupsTick();
+    return res.status(200).send("tick ok");
+  } catch (e) {
+    console.error("[/tick] ERROR:", e?.stack || e?.message || e);
+    return res.status(200).send("tick ok");
+  }
+});
 
 app.listen(PORT, () => console.log("running on", PORT));
