@@ -202,9 +202,7 @@ function getAudioUrl(body) {
   const a1 = body.attachments?.[0]?.url || body.attachments?.[0]?.payload?.url;
   if (a1) return safeText(a1);
 
-  const a2 =
-    body.message?.attachments?.[0]?.url ||
-    body.message?.attachments?.[0]?.payload?.url;
+  const a2 = body.message?.attachments?.[0]?.url || body.message?.attachments?.[0]?.payload?.url;
   if (a2) return safeText(a2);
 
   const fcd = body.full_contact_data;
@@ -673,7 +671,7 @@ async function processDueFollowupsTick(limit = FOLLOWUP_BATCH_LIMIT) {
 // --- OpenAI ---
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ✅ PROMPT ajustado: entiende números + maneja “precio/preguntas raras” redirigiendo sin romper el flujo
+// ✅ PROMPT: cierre variable según selección
 function buildSystemPrompt() {
   return `
 Eres Zia Bot, el asistente comercial de Zia Lab Agency. Hablas como una persona real, cercana y profesional, con tono relajado-formal en español natural (RD si aplica).
@@ -708,12 +706,11 @@ NORMALIZACIÓN (SÚPER IMPORTANTE)
 - Acepta: “ambos”, “los dos”, “2 servicios” como Ambos.
 
 MANEJO DE MENSAJES “RAROS” / FUERA DE FLUJO (PRECIO, TIEMPO, GARANTÍA, ETC)
-- Si el usuario pregunta precio, tiempo, “cuánto cuesta”, “planes”, “promo”, o algo que NO responde la pregunta pendiente:
-  1) Responde amable: “Te explico eso en un momentito 😊”
-  2) Dile que para enviarlo correcto necesita 3 respuestas rápidas
+- Si el usuario pregunta precio/tiempo/etc y NO responde la pregunta pendiente:
+  1) Responde: “Te explico eso en un momentito 😊”
+  2) Dile que para enviarlo correcto necesitas 3 respuestas rápidas
   3) Repite EXACTAMENTE la pregunta que toca según pending
-  4) MUY IMPORTANTE: NO inventes respuestas, NO avances estado si no respondió.
-  (En ese caso, mantén state igual y pending igual.)
+  4) NO avances el estado si no respondió.
 
 PREGUNTAS (en este orden, SIN botones; incluye opciones en el mismo mensaje)
 1) (sector) ¿Qué necesitas ahora mismo?
@@ -734,9 +731,16 @@ REGLAS IMPORTANTES
 - Si el usuario responde varias cosas en un mismo mensaje (incluyendo audio transcrito), extrae y guarda TODO lo que puedas para: sector, servicio y redes.
 - Si ya tienes las 3 respuestas (sector + servicio + redes), NO preguntes más: cierra.
 
-CIERRE (cuando ya tengas las 3):
-Responde EXACTO:
-“Perfecto 🙌 ya reviso tu negocio y te envío el demo con la propuesta del 30% OFF.”
+CIERRE (cuando ya tengas las 3) — SEGÚN SELECCIÓN:
+- Si state.sector es “Página web”:
+  Responde EXACTO:
+  “Perfecto 🙌 ya reviso tu negocio y te envío el demo con la propuesta del 30% OFF.”
+- Si state.sector es “Bot para WhatsApp”:
+  Responde EXACTO:
+  “Perfecto 🙌 ya reviso tu negocio y te envío el demo. Tienes 7 días de prueba gratis 🤖✨”
+- Si state.sector es “Ambos”:
+  Responde EXACTO:
+  “Perfecto 🙌 ya reviso tu negocio y te envío el demo: 30% OFF en la web + 7 días gratis del bot 🤖🚀”
 
 y marca: cerrado=true, cierre_enviado=true y objetivo="calificado".
 
@@ -879,12 +883,13 @@ app.post("/mc/reply", async (req, res) => {
     const raw = completion.choices?.[0]?.message?.content || "";
     let parsed = safeParseModelJson(raw);
 
+    // ✅ si viene roto, reintenta 1 vez “reparando” JSON
     if (!parsed) {
       console.error("[/mc/reply] JSON parse fail (raw):", raw);
 
       const repair = await openai.chat.completions.create({
         model: MODEL,
-        temperature: 0,
+       temperature: 0,
         max_tokens: 260,
         response_format: { type: "json_object" },
         messages: [
