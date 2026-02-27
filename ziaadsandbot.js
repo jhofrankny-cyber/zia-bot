@@ -37,7 +37,7 @@ function clampHistory(history, max = 10) {
   return history.slice(-max);
 }
 
-// ✅ NUEVO: detectar @ / links / nombres raros sin “rechazarlos”
+// ✅ detectar @ / links / nombres raros sin “rechazarlos”
 function looksLikeLinkOrHandle(t) {
   const s = safeText(t);
   const low = s.toLowerCase();
@@ -75,14 +75,6 @@ function looksLikeBusinessName(t) {
     "si",
     "sí",
     "no",
-    "ambos",
-    "ambas",
-    "redes",
-    "bot",
-    "ventas",
-    "leads",
-    "reservas",
-    "posicionamiento",
     "👍",
     "...",
     "..",
@@ -91,8 +83,7 @@ function looksLikeBusinessName(t) {
 
   if (blocked.has(low)) return false;
 
-  // Si no parece link/@ pero tiene 3+ caracteres, lo aceptamos como nombre raro válido.
-  // (permite emojis, números, guiones, mayúsculas, abreviaciones, letras repetidas, etc.)
+  // Si no parece link/@ pero tiene 3+ caracteres, lo aceptamos como nombre válido
   return true;
 }
 
@@ -100,14 +91,16 @@ function looksLikeBusinessName(t) {
 function defaultMemory() {
   return {
     rubro: "",
-    servicio: "",
+    // ✅ Se mantiene el campo para NO romper nada, pero ya NO se pregunta (siempre es un paquete)
+    servicio: "paquete_adsmas_ads_bot",
     redes: "",
     objetivo: "",
+
     cerrado: false,
     cierre_enviado: false,
 
-    // qué falta pedir (evita loops)
-    pending: "rubro", // rubro -> servicio -> redes -> objetivo -> none
+    // ✅ SOLO 3 preguntas ahora: rubro -> redes -> objetivo
+    pending: "rubro", // rubro -> redes -> objetivo -> none
 
     // historial reducido
     history: [], // [{role:"user"/"assistant", content:"..."}]
@@ -144,55 +137,42 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 function buildSystemPrompt() {
   return `
-Eres AdsMass Bot, el asistente comercial de Zia Lab Agency para el paquete *AdsMass Asistente Virtual* (WhatsApp).
-Hablas como una persona real, cercana y profesional, con tono relajado-formal en español natural (RD si aplica).
+Eres Zia Bot, el asistente comercial de Zia Lab (campaña AdsMass). Hablas como una persona real, cercana y profesional, español natural (RD si aplica).
+
+CONTEXTO (OBLIGATORIO)
+- El anuncio y el video dicen: “Si tu negocio recibe mensajes por WhatsApp y no respondes rápido… estás perdiendo clientes todos los días.”
+- Se presenta el paquete AdsMass: Ads + Asistente Virtual de WhatsApp (respuestas inmediatas, info automática, agenda/compra sin esperar).
+- Hay precio especial por los primeros 3 meses si activan hoy. Menciónalo natural en el cierre.
 
 REGLAS CLAVE
-- No repitas el saludo si ya existe conversación previa (si el historial ya tiene mensajes del bot).
+- No repitas el saludo si ya hay historial del bot.
 - Mensajes cortos (máx. 2-3 líneas).
 - Una sola pregunta por mensaje.
 - Emojis variados y naturales (😊✨🚀🙌🧡).
 - No uses etiquetas tipo “[CLIENTE]”.
-- No hagas propuestas largas, diagnósticos extensos ni bullets.
-- No inventes datos si el usuario no lo dijo.
+- No hagas propuestas largas ni bullets.
 
-✅ APERTURA (HOOK DEL VIDEO)
-- Si el estado pending = "rubro" y el historial aún NO tiene mensajes del bot, abre con:
-  “Si tu negocio recibe mensajes por WhatsApp y no respondes rápido… estás perdiendo clientes todos los días.”
-  y enseguida haz UNA sola pregunta: “¿A qué se dedica tu negocio?” (o equivalente).
-
-✅ CONTEXTO DE LA PUBLICIDAD (para responder natural si preguntan “de qué trata” / “info”)
-- Hablamos sobre cómo los negocios pierden clientes y dinero por no responder rápido los mensajes de WhatsApp.
-- Presentamos el paquete AdsMass Asistente Virtual: respuestas inmediatas, información automática y posibilidad de agendar o comprar sin esperar.
-- Oferta: precio especial para los primeros 3 meses si activas hoy el paquete de AdsMass Bot.
-- Mantén esto corto (2-3 líneas máximo) y vuelve a UNA pregunta para avanzar.
+INFORMACIÓN MÍNIMA A OBTENER (SOLO 3 PREGUNTAS)
+1) rubro (¿a qué se dedica?)
+2) redes: link o @; si no tiene, nombre del negocio (acepta nombres “raros”)
+3) objetivo: ventas / leads / reservas / compras
 
 ✅ REGLA PARA NOMBRES/REDES (MUY IMPORTANTE)
-- Cuando estés en el paso "redes" (pending = redes), acepta como válido cualquier texto que parezca:
-  a) un @usuario (ej: @jc_import, @xX-Glow✨),
-  b) un link (contenga "http", ".com", ".do", "instagram", "tiktok", "wa.me"),
-  c) o un NOMBRE DE NEGOCIO aunque sea raro (puede tener emojis, números, guiones, mayúsculas, abreviaciones, letras repetidas).
-- NO pidas repetir solo porque el nombre es “raro”.
-- Solo pide repetir si el mensaje tiene 1-2 caracteres, o es claramente un saludo (hola, ok, gracias), o es un ruido tipo "..." o solo emojis sueltos.
-- Si el texto NO parece link/@ pero tiene 3+ caracteres, guárdalo como nombre del negocio en state.redes.
-
-INFORMACIÓN MÍNIMA A OBTENER (solo esto)
-1) rubro
-2) servicio: redes / bot / ambos
-3) redes: link o @; si no tiene, nombre del negocio
-4) objetivo: ventas / leads / reservas / posicionamiento
+- Cuando estés en "redes", acepta como válido: @usuario, link, o nombre del negocio (aunque sea raro).
+- NO pidas repetir solo porque el nombre sea raro.
+- Solo pide repetir si tiene 1-2 caracteres o es claramente saludo/ruido.
 
 TAREA
-- Usa el estado recibido (rubro/servicio/redes/objetivo/cerrado/cierre_enviado/pending).
-- Interpreta respuestas de una palabra según la última pregunta (pending).
-- Pregunta SOLO 1 cosa siguiendo el orden rubro -> servicio -> redes -> objetivo.
-- Cuando ya tengas las 4, envía el CIERRE ÚNICO y marca cerrado=true y cierre_enviado=true.
+- Usa el estado recibido (rubro/redes/objetivo/cerrado/cierre_enviado/pending).
+- Pregunta SOLO 1 cosa siguiendo el orden rubro -> redes -> objetivo.
+- NO preguntes “redes/bot/ambos” porque YA ES UN PAQUETE.
+- Cuando ya tengas las 3, envía el CIERRE ÚNICO y marca cerrado=true y cierre_enviado=true.
 - Si ya cerraste y el usuario dice ok/gracias/hola/mañana/perfecto/listo/👍 responde SOLO:
   “¡Listo! Ya quedó registrado 🙌 te escribe un representante.”
 
-CIERRE ÚNICO (usa el servicio y el objetivo final)
-“¡Perfecto! Entonces con *AdsMass Asistente Virtual* trabajaremos [servicio] enfocados en [objetivo]. 😊
-Un representante de Zia Lab te contacta en breve para enviarte la propuesta y el precio especial por los primeros 3 meses si activas hoy 🚀”
+CIERRE ÚNICO
+“¡Perfecto! 🙌 Con el *paquete AdsMass (Ads + Asistente Virtual de WhatsApp)* te configuramos respuesta inmediata y agenda/compra sin esperar.
+Un representante te contacta para enviarte la propuesta con el *precio especial por los primeros 3 meses* si lo activas hoy 🚀”
 
 SALIDA OBLIGATORIA:
 Devuelve SOLO JSON válido (sin texto extra), con este formato:
@@ -200,25 +180,24 @@ Devuelve SOLO JSON válido (sin texto extra), con este formato:
   "reply": "mensaje para el usuario",
   "state": {
     "rubro": "",
-    "servicio": "",
+    "servicio": "paquete_adsmas_ads_bot",
     "redes": "",
     "objetivo": "",
     "cerrado": false,
     "cierre_enviado": false,
-    "pending": "rubro|servicio|redes|objetivo|none"
+    "pending": "rubro|redes|objetivo|none"
   }
 }
 
 Reglas del JSON:
-- "reply" debe ser lo que se enviará al usuario.
-- "state" debe venir actualizado según el último mensaje del usuario y el estado previo.
-- Nunca inventes datos: si no lo dijo, déjalo igual.
+- "reply" es lo que se enviará al usuario.
+- "state" debe venir actualizado.
+- Nunca inventes datos.
 `;
 }
 
 function inferPending(mem) {
   if (!mem.rubro) return "rubro";
-  if (!mem.servicio) return "servicio";
   if (!mem.redes) return "redes";
   if (!mem.objetivo) return "objetivo";
   return "none";
@@ -257,6 +236,10 @@ app.post("/mc/reply", async (req, res) => {
 
     // 1) cargar memoria
     const mem = await loadMemory(contactId);
+
+    // ✅ asegurar que siempre sea paquete (sin preguntar)
+    if (!mem.servicio) mem.servicio = "paquete_adsmas_ads_bot";
+
     mem.pending = inferPending(mem);
 
     // Si ya cerró y el usuario escribe ack -> respuesta corta
@@ -264,12 +247,12 @@ app.post("/mc/reply", async (req, res) => {
       return res.json({ reply: "¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante." });
     }
 
-    // ✅ NUEVO: si estamos en paso "redes", aceptar nombres raros sin hacer que el modelo pida repetir
+    // ✅ si estamos en paso "redes", aceptar nombres raros sin hacer que el modelo pida repetir
     if (mem.pending === "redes" && !mem.redes) {
       if (looksLikeLinkOrHandle(userText) || looksLikeBusinessName(userText)) {
         mem.redes = userText; // guardar tal cual
         mem.pending = inferPending(mem);
-        // no retornamos todavía: dejamos que el modelo pregunte objetivo con el estado ya actualizado
+        // no retornamos todavía: dejamos que el modelo pregunte objetivo con el estado actualizado
       }
     }
 
@@ -278,7 +261,7 @@ app.post("/mc/reply", async (req, res) => {
 
     const stateSnapshot = {
       rubro: mem.rubro,
-      servicio: mem.servicio,
+      servicio: mem.servicio, // se mantiene por compatibilidad
       redes: mem.redes,
       objetivo: mem.objetivo,
       cerrado: !!mem.cerrado,
@@ -319,9 +302,11 @@ app.post("/mc/reply", async (req, res) => {
 
     // 4) actualizar memoria (estado)
     mem.rubro = safeText(newState.rubro) || mem.rubro;
-    mem.servicio = safeText(newState.servicio) || mem.servicio;
 
-    // ✅ NUEVO: si ya guardamos redes arriba, no la sobreescribas con vacío
+    // ✅ servicio se mantiene fijo (paquete), no se pregunta ni se cambia
+    mem.servicio = "paquete_adsmas_ads_bot";
+
+    // ✅ si ya guardamos redes arriba, no la sobreescribas con vacío
     mem.redes = safeText(newState.redes) || mem.redes;
 
     mem.objetivo = safeText(newState.objetivo) || mem.objetivo;
@@ -352,3 +337,14 @@ app.post("/mc/reply", async (req, res) => {
 app.get("/health", (_req, res) => res.send("ok"));
 
 app.listen(PORT, () => console.log("running on", PORT));
+
+/*
+COPY (referencia del anuncio / caption):
+Muchas empresas invierten dinero en publicidad para atraer clientes… pero cuando las personas escriben, nadie responde a tiempo.
+
+Con nuestro paquete de ads + asistente virtual de WhatsApp, las personas que llegan desde la publicidad reciben respuesta inmediata, información automática y pueden agendar o comprar sin esperar.
+
+Activa el paquete de Ads + Bot y obtén precio promocional durante los primeros 3 meses.
+
+Si quieres convertir tus mensajes en clientes reales, escríbenos y te explicamos cómo funciona.
+*/
