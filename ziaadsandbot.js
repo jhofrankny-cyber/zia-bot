@@ -1,3 +1,10 @@
+// index.js (ManyChat -> Zia Bot / AdsMass Asistente Virtual)
+// ✅ CAMBIOS APLICADOS:
+// 1) Se elimina la “pregunta #2” (servicio: redes/bot/ambos). Ahora es un PAQUETE.
+// 2) Se ajusta bienvenida + flujo + cierre para que esté 100% acorde al caption y guion del video.
+//    (3 preguntas en total: rubro -> redes -> objetivo)
+// ⚠️ Regla de oro: no se eliminan flujos que ya funcionan; solo se ajusta el state/prompt.
+
 const express = require("express");
 const Redis = require("ioredis");
 const OpenAI = require("openai");
@@ -37,7 +44,7 @@ function clampHistory(history, max = 10) {
   return history.slice(-max);
 }
 
-// ✅ detectar @ / links / nombres raros sin “rechazarlos”
+// ✅ NUEVO: detectar @ / links / nombres raros sin “rechazarlos”
 function looksLikeLinkOrHandle(t) {
   const s = safeText(t);
   const low = s.toLowerCase();
@@ -49,7 +56,9 @@ function looksLikeLinkOrHandle(t) {
     low.includes(".do") ||
     low.includes("instagram") ||
     low.includes("tiktok") ||
-    low.includes("wa.me")
+    low.includes("wa.me") ||
+    low.includes("facebook") ||
+    low.includes("fb")
   );
 }
 
@@ -79,27 +88,37 @@ function looksLikeBusinessName(t) {
     "...",
     "..",
     ".",
+    "oferta",
+    "promo",
+    "promocion",
+    "promoción",
+    "precio",
+    "costo",
+    "cuanto",
+    "cuánto",
+    "info",
+    "informacion",
+    "información",
   ]);
 
   if (blocked.has(low)) return false;
 
-  // Si no parece link/@ pero tiene 3+ caracteres, lo aceptamos como nombre válido
+  // Si no parece link/@ pero tiene 3+ caracteres, lo aceptamos como nombre raro válido.
   return true;
 }
 
 // --- Memory ---
 function defaultMemory() {
   return {
+    // ✅ 3 datos (ya NO existe "servicio" porque es un paquete)
     rubro: "",
-    // ✅ Se mantiene el campo para NO romper nada, pero ya NO se pregunta (siempre es un paquete)
-    servicio: "paquete_adsmas_ads_bot",
     redes: "",
     objetivo: "",
 
     cerrado: false,
     cierre_enviado: false,
 
-    // ✅ SOLO 3 preguntas ahora: rubro -> redes -> objetivo
+    // qué falta pedir (evita loops)
     pending: "rubro", // rubro -> redes -> objetivo -> none
 
     // historial reducido
@@ -111,7 +130,6 @@ function defaultMemory() {
 const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
 const redis = redisUrl
   ? new Redis(redisUrl, {
-      // Upstash/Redis TLS: en algunos entornos ayuda esto
       tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
       maxRetriesPerRequest: 2,
       enableReadyCheck: true,
@@ -137,42 +155,64 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 function buildSystemPrompt() {
   return `
-Eres Zia Bot, el asistente comercial de Zia Lab (campaña AdsMass). Hablas como una persona real, cercana y profesional, español natural (RD si aplica).
+Eres Zia Bot, el asistente comercial de Zia Lab Agency. Hablas como una persona real, cercana y profesional, en español natural (RD si aplica).
 
-CONTEXTO (OBLIGATORIO)
-- El anuncio y el video dicen: “Si tu negocio recibe mensajes por WhatsApp y no respondes rápido… estás perdiendo clientes todos los días.”
-- Se presenta el paquete AdsMass: Ads + Asistente Virtual de WhatsApp (respuestas inmediatas, info automática, agenda/compra sin esperar).
-- Hay precio especial por los primeros 3 meses si activan hoy. Menciónalo natural en el cierre.
+CONTEXTO (CAPTION + GUION)
+- Mensaje del video: “Si tu negocio recibe mensajes por WhatsApp y no respondes rápido… estás perdiendo clientes todos los días.”
+- Oferta: Paquete “AdsMass Asistente Virtual” (Anuncios + Asistente Virtual en WhatsApp).
+  Beneficio: respuesta inmediata, info automática y ayuda a agendar o comprar sin esperar.
+  Promo: precio especial / 30% OFF durante los primeros 3 meses si activa hoy.
 
 REGLAS CLAVE
-- No repitas el saludo si ya hay historial del bot.
+- No repitas el saludo si ya existe conversación previa (si el historial ya tiene mensajes del bot).
 - Mensajes cortos (máx. 2-3 líneas).
 - Una sola pregunta por mensaje.
-- Emojis variados y naturales (😊✨🚀🙌🧡).
+- Emojis naturales (😊✨🚀🙌🧡).
 - No uses etiquetas tipo “[CLIENTE]”.
-- No hagas propuestas largas ni bullets.
-
-INFORMACIÓN MÍNIMA A OBTENER (SOLO 3 PREGUNTAS)
-1) rubro (¿a qué se dedica?)
-2) redes: link o @; si no tiene, nombre del negocio (acepta nombres “raros”)
-3) objetivo: ventas / leads / reservas / compras
+- No hagas propuestas largas, diagnósticos extensos ni bullets.
+- No inventes datos si el usuario no lo dijo.
 
 ✅ REGLA PARA NOMBRES/REDES (MUY IMPORTANTE)
-- Cuando estés en "redes", acepta como válido: @usuario, link, o nombre del negocio (aunque sea raro).
-- NO pidas repetir solo porque el nombre sea raro.
-- Solo pide repetir si tiene 1-2 caracteres o es claramente saludo/ruido.
+- Cuando estés en el paso "redes" (pending = redes), acepta como válido cualquier texto que parezca:
+  a) un @usuario,
+  b) un link,
+  c) o un NOMBRE de negocio aunque sea raro (emojis, números, guiones, mayúsculas, etc.).
+- NO pidas repetir solo porque el nombre es “raro”.
+- Solo pide repetir si el mensaje tiene 1-2 caracteres, o es saludo/ack (“hola”, “ok”, “gracias”), o ruido tipo "..." o solo emojis sueltos.
+- Si el texto NO parece link/@ pero tiene 3+ caracteres, guárdalo como nombre del negocio en state.redes.
+
+📌 INFORMACIÓN MÍNIMA A OBTENER (SOLO 3 PREGUNTAS)
+1) rubro (¿qué tipo de negocio es?)
+2) redes (su @ o link; si no tiene, nombre del negocio)
+3) objetivo (ventas / leads / reservas / compras)
+
+CÓMO RESPONDER SI PREGUNTAN POR LA OFERTA / PROMO
+- Si el usuario pregunta “¿qué están promocionando?”, “¿cuál es la oferta?”, “¿cómo funciona?”:
+  Responde claro y corto:
+  “Estamos promocionando el paquete AdsMass 😊 Incluye anuncios para atraer clientes + un asistente en WhatsApp que responde al instante y ayuda a agendar o comprar. Si lo activas hoy, tienes precio especial/30% OFF los primeros 3 meses.”
+  Luego haz la pregunta que toque según pending (sin saltarte el orden).
+
+CÓMO RESPONDER SI PREGUNTAN “¿QUÉ ES UN BOT?”
+- Responde simple:
+  “Es un asistente automático en WhatsApp ✅ Responde al instante, da información y guía al cliente para agendar o comprar.”
+  Luego haz la pregunta que toque según pending.
 
 TAREA
 - Usa el estado recibido (rubro/redes/objetivo/cerrado/cierre_enviado/pending).
-- Pregunta SOLO 1 cosa siguiendo el orden rubro -> redes -> objetivo.
-- NO preguntes “redes/bot/ambos” porque YA ES UN PAQUETE.
+- Interpreta respuestas cortas según la última pregunta (pending).
+- Pregunta SOLO 1 cosa siguiendo el orden: rubro -> redes -> objetivo.
 - Cuando ya tengas las 3, envía el CIERRE ÚNICO y marca cerrado=true y cierre_enviado=true.
 - Si ya cerraste y el usuario dice ok/gracias/hola/mañana/perfecto/listo/👍 responde SOLO:
   “¡Listo! Ya quedó registrado 🙌 te escribe un representante.”
 
-CIERRE ÚNICO
-“¡Perfecto! 🙌 Con el *paquete AdsMass (Ads + Asistente Virtual de WhatsApp)* te configuramos respuesta inmediata y agenda/compra sin esperar.
-Un representante te contacta para enviarte la propuesta con el *precio especial por los primeros 3 meses* si lo activas hoy 🚀”
+BIENVENIDA (cuando pending=rubro y no hay historial del bot)
+“Hola 👋 Si tu negocio recibe mensajes por WhatsApp y no respondes rápido, se pierden clientes 😅
+Con AdsMass (Ads + Asistente Virtual) respondes al instante y pueden agendar o comprar.
+¿Qué tipo de negocio tienes?”
+
+CIERRE ÚNICO (usa el objetivo final)
+“¡Perfecto! 😊 Entonces con *AdsMass* vamos a ayudarte a lograr *[objetivo]* con anuncios + respuestas automáticas en WhatsApp para que no se pierdan clientes.
+Un representante de Zia Lab te contacta en breve con la propuesta y el 30% OFF por los primeros 3 meses 🚀”
 
 SALIDA OBLIGATORIA:
 Devuelve SOLO JSON válido (sin texto extra), con este formato:
@@ -180,7 +220,6 @@ Devuelve SOLO JSON válido (sin texto extra), con este formato:
   "reply": "mensaje para el usuario",
   "state": {
     "rubro": "",
-    "servicio": "paquete_adsmas_ads_bot",
     "redes": "",
     "objetivo": "",
     "cerrado": false,
@@ -190,9 +229,9 @@ Devuelve SOLO JSON válido (sin texto extra), con este formato:
 }
 
 Reglas del JSON:
-- "reply" es lo que se enviará al usuario.
-- "state" debe venir actualizado.
-- Nunca inventes datos.
+- "reply" debe ser lo que se enviará al usuario.
+- "state" debe venir actualizado según el último mensaje del usuario y el estado previo.
+- Nunca inventes datos: si el usuario no lo dijo, déjalo igual.
 `;
 }
 
@@ -213,7 +252,6 @@ app.post("/mc/reply", async (req, res) => {
   const started = Date.now();
 
   try {
-    // Logs mínimos (Render)
     console.log("[/mc/reply] hit", new Date().toISOString());
 
     if (!mustAuth(req)) {
@@ -236,10 +274,6 @@ app.post("/mc/reply", async (req, res) => {
 
     // 1) cargar memoria
     const mem = await loadMemory(contactId);
-
-    // ✅ asegurar que siempre sea paquete (sin preguntar)
-    if (!mem.servicio) mem.servicio = "paquete_adsmas_ads_bot";
-
     mem.pending = inferPending(mem);
 
     // Si ya cerró y el usuario escribe ack -> respuesta corta
@@ -247,12 +281,11 @@ app.post("/mc/reply", async (req, res) => {
       return res.json({ reply: "¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante." });
     }
 
-    // ✅ si estamos en paso "redes", aceptar nombres raros sin hacer que el modelo pida repetir
+    // ✅ Si estamos en paso "redes", aceptar nombres raros sin hacer que el modelo pida repetir
     if (mem.pending === "redes" && !mem.redes) {
       if (looksLikeLinkOrHandle(userText) || looksLikeBusinessName(userText)) {
         mem.redes = userText; // guardar tal cual
         mem.pending = inferPending(mem);
-        // no retornamos todavía: dejamos que el modelo pregunte objetivo con el estado actualizado
       }
     }
 
@@ -261,7 +294,6 @@ app.post("/mc/reply", async (req, res) => {
 
     const stateSnapshot = {
       rubro: mem.rubro,
-      servicio: mem.servicio, // se mantiene por compatibilidad
       redes: mem.redes,
       objetivo: mem.objetivo,
       cerrado: !!mem.cerrado,
@@ -281,8 +313,8 @@ app.post("/mc/reply", async (req, res) => {
       model: MODEL,
       messages,
       temperature: 0.2,
-      max_tokens: 260,
-      response_format: { type: "json_object" }, // <-- clave para no romper JSON
+      max_tokens: 280,
+      response_format: { type: "json_object" },
     });
 
     const raw = completion.choices?.[0]?.message?.content || "{}";
@@ -302,9 +334,6 @@ app.post("/mc/reply", async (req, res) => {
 
     // 4) actualizar memoria (estado)
     mem.rubro = safeText(newState.rubro) || mem.rubro;
-
-    // ✅ servicio se mantiene fijo (paquete), no se pregunta ni se cambia
-    mem.servicio = "paquete_adsmas_ads_bot";
 
     // ✅ si ya guardamos redes arriba, no la sobreescribas con vacío
     mem.redes = safeText(newState.redes) || mem.redes;
@@ -339,12 +368,8 @@ app.get("/health", (_req, res) => res.send("ok"));
 app.listen(PORT, () => console.log("running on", PORT));
 
 /*
-COPY (referencia del anuncio / caption):
-Muchas empresas invierten dinero en publicidad para atraer clientes… pero cuando las personas escriben, nadie responde a tiempo.
-
-Con nuestro paquete de ads + asistente virtual de WhatsApp, las personas que llegan desde la publicidad reciben respuesta inmediata, información automática y pueden agendar o comprar sin esperar.
-
-Activa el paquete de Ads + Bot y obtén precio promocional durante los primeros 3 meses.
-
-Si quieres convertir tus mensajes en clientes reales, escríbenos y te explicamos cómo funciona.
+Referencia (caption/idea) — NO se ejecuta:
+Hablamos sobre cómo los negocios pierden clientes y dinero por no responder rápido los mensajes de WhatsApp.
+Paquete AdsMass Asistente Virtual: respuestas inmediatas, info automática y permite agendar o comprar sin esperar.
+Precio especial para los primeros 3 meses si activas hoy el paquete.
 */
