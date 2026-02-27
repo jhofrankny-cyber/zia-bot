@@ -211,8 +211,7 @@ TAREA
   “¡Listo! Ya quedó registrado 🙌 te escribe un representante.”
 
 BIENVENIDA (cuando pending=rubro y no hay historial del bot)
-“Hola 👋 Si tu negocio recibe mensajes por WhatsApp y no respondes rápido, se pierden clientes 😅
-Con AdsMass (Ads + Asistente Virtual) respondes al instante y pueden agendar o comprar.
+“Hola 👋 Con AdsMass (Ads + Asistente Virtual) respondes al instante y tus clientes pueden agendar o comprar.
 ¿Qué tipo de negocio tienes?”
 
 CIERRE ÚNICO (usa el objetivo final)
