@@ -3,7 +3,8 @@
 // 1) Se elimina la “pregunta #2” (servicio: redes/bot/ambos). Ahora es un PAQUETE.
 // 2) Se ajusta bienvenida + flujo + cierre para que esté 100% acorde al caption y guion del video.
 //    (3 preguntas en total: rubro -> redes -> objetivo)
-// ⚠️ Regla de oro: no se eliminan flujos que ya funcionan; solo se ajusta el state/prompt.
+// 3) ✅ Se agrega /tick (UptimeRobot) para evitar 404 y mantener el bot despierto.
+// ⚠️ Regla de oro: no se eliminan flujos que ya funcionan; solo se agrega lo necesario.
 
 const express = require("express");
 const Redis = require("ioredis");
@@ -18,6 +19,10 @@ const MC_AUTH_TOKEN = process.env.MC_AUTH_TOKEN || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const REDIS_URL_RAW = process.env.REDIS_URL || "";
+
+// ✅ NEW: Token para proteger /tick (opcional)
+// Si lo dejas vacío, /tick funciona sin token (modo dev)
+const TICK_TOKEN = (process.env.TICK_TOKEN || "").trim();
 
 // --- Helpers ---
 function safeText(x) {
@@ -314,7 +319,7 @@ app.post("/mc/reply", async (req, res) => {
       messages,
       temperature: 0.2,
       max_tokens: 280,
-      response_format: { type: "json_object" },
+      response_format: { type: "json_object" }, // <-- clave para no romper JSON
     });
 
     const raw = completion.choices?.[0]?.message?.content || "{}";
@@ -365,6 +370,28 @@ app.post("/mc/reply", async (req, res) => {
 
 app.get("/health", (_req, res) => res.send("ok"));
 
+// =========================
+// ✅ /tick (UptimeRobot) - evita 404 y mantiene el servicio despierto
+// - UptimeRobot usa HEAD muchas veces, por eso agregamos app.head también
+// - Si configuras TICK_TOKEN, exige ?token=...
+// =========================
+function isValidTickToken(req) {
+  if (!TICK_TOKEN) return true;
+  const token = safeText(req.query?.token);
+  return token && token === TICK_TOKEN;
+}
+
+app.get("/tick", (req, res) => {
+  if (!isValidTickToken(req)) return res.status(401).send("unauthorized");
+  return res.status(200).send("tick ok");
+});
+
+app.head("/tick", (req, res) => {
+  if (!isValidTickToken(req)) return res.status(401).end();
+  return res.status(200).end();
+});
+
+// Start
 app.listen(PORT, () => console.log("running on", PORT));
 
 /*
