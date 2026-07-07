@@ -1,6 +1,10 @@
 const express = require("express");
-const Redis = require("ioredis");
-const OpenAI = require("openai");
+let Redis = null;
+try {
+  Redis = require("ioredis");
+} catch (err) {
+  console.warn("[startup] ioredis no está instalado; se usará memoria temporal sin Redis.");
+}
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -8,9 +12,8 @@ app.use(express.json({ limit: "1mb" }));
 // ENV
 const PORT = process.env.PORT || 3000;
 const MC_AUTH_TOKEN = process.env.MC_AUTH_TOKEN || "";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const REDIS_URL_RAW = process.env.REDIS_URL || "";
+const ADVISOR_TEXT = process.env.ZIA_ADVISOR_TEXT || "Un asesor de ZIA Lab te contactará lo antes posible.";
 
 // --- Helpers ---
 function safeText(x) {
@@ -27,78 +30,61 @@ function normalizeRedisUrl(url) {
   const u = safeText(url);
   if (!u) return "";
   // Upstash suele requerir TLS => rediss://
-  // Si te llegó redis:// lo convertimos a rediss://
   if (u.startsWith("redis://")) return "rediss://" + u.slice("redis://".length);
   return u;
 }
 
-function clampHistory(history, max = 10) {
+function stripAccents(text) {
+  return safeText(text)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function normalizeText(text) {
+  return stripAccents(text)
+    .toLowerCase()
+    .replace(/[¡!¿?.,;:()[\]{}"']/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function clampHistory(history, max = 12) {
   if (!Array.isArray(history)) return [];
   return history.slice(-max);
 }
 
-// ✅ NUEVO: detectar @ / links / nombres raros sin “rechazarlos”
-function looksLikeLinkOrHandle(t) {
-  const s = safeText(t);
-  const low = s.toLowerCase();
-  return (
-    s.includes("@") ||
-    low.includes("http") ||
-    low.includes("www.") ||
-    low.includes(".com") ||
-    low.includes(".do") ||
-    low.includes("instagram") ||
-    low.includes("tiktok") ||
-    low.includes("wa.me")
-  );
+function optionNumber(text) {
+  const t = normalizeText(text);
+  const match = t.match(/^([1-9])\b/);
+  return match ? match[1] : "";
 }
 
-function looksLikeBusinessName(t) {
-  const s = safeText(t);
-  if (s.length < 3) return false;
+function hasAny(text, words) {
+  const t = normalizeText(text);
+  return words.some((w) => t.includes(normalizeText(w)));
+}
 
-  const low = s.toLowerCase();
+function isAck(text) {
+  const t = normalizeText(text);
+  return ["ok", "okay", "gracias", "perfecto", "listo", "bien", "dale", "👍"].includes(t);
+}
 
-  // Evitar confundir respuestas típicas con “nombre”
-  const blocked = new Set([
-    "hola",
-    "buenas",
-    "buenos dias",
-    "buenas tardes",
-    "buenas noches",
-    "ok",
-    "okay",
-    "gracias",
-    "mañana",
-    "perfecto",
-    "listo",
-    "si",
-    "sí",
-    "no",
-    "ambos",
-    "ambas",
-    "redes",
-    "bot",
-    "ventas",
-    "leads",
-    "reservas",
-    "posicionamiento",
-    "👍",
-    "...",
-    "..",
-    ".",
-  ]);
+function isGreetingOnly(text) {
+  const t = normalizeText(text);
+  return ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "saludos", "hey", "hello"].includes(t);
+}
 
-  if (blocked.has(low)) return false;
-
-  // Si no parece link/@ pero tiene 3+ caracteres, lo aceptamos como nombre raro válido.
-  // (permite emojis, números, guiones, mayúsculas, abreviaciones, letras repetidas, etc.)
-  return true;
+function isNoise(text) {
+  const s = safeText(text);
+  if (!s) return true;
+  const t = normalizeText(s);
+  return s.length <= 1 || [".", "..", "...", "👍", "🙏"].includes(s) || ["", "si", "sí", "no"].includes(t);
 }
 
 // --- Memory ---
 function defaultMemory() {
   return {
+    // Compatibilidad con versiones anteriores
     rubro: "",
     servicio: "",
     redes: "",
@@ -106,118 +92,183 @@ function defaultMemory() {
     cerrado: false,
     cierre_enviado: false,
 
-    // qué falta pedir (evita loops)
-    pending: "rubro", // rubro -> servicio -> redes -> objetivo -> none
+    // Flujo simple para leads desde video
+    campaign: "zia_video_leads",
+    pending: "business_name",
+    business_name: "",
+    service_interest: "",
+    status: "nuevo_lead",
+    human_handoff: false,
 
-    // historial reducido
-    history: [] // [{role:"user"/"assistant", content:"..."}]
+    history: []
   };
+}
+
+function mergeDefaults(mem) {
+  return { ...defaultMemory(), ...(mem || {}) };
 }
 
 // --- Redis ---
 const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
-const redis = redisUrl
+const redis = redisUrl && Redis
   ? new Redis(redisUrl, {
-      // Upstash/Redis TLS: en algunos entornos ayuda esto
       tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
       maxRetriesPerRequest: 2,
       enableReadyCheck: true,
     })
   : null;
 
+// Fallback local para desarrollo o despliegues sin REDIS_URL.
+// En producción con varias instancias, configura REDIS_URL para persistencia compartida.
+const localMemory = new Map();
+
 async function loadMemory(contactId) {
-  if (!redis) return defaultMemory();
   const key = `zia:${contactId}`;
+  if (!redis) return mergeDefaults(localMemory.get(key) || defaultMemory());
   const raw = await redis.get(key);
-  return raw ? JSON.parse(raw) : defaultMemory();
-}
-
-async function saveMemory(contactId, mem) {
-  if (!redis) return;
-  const key = `zia:${contactId}`;
-  // TTL 7 días
-  await redis.set(key, JSON.stringify(mem), "EX", 60 * 60 * 24 * 7);
-}
-
-// --- OpenAI ---
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-function buildSystemPrompt() {
-  return `
-Eres Zia Bot, el asistente comercial de Zia Lab Agency. Hablas como una persona real, cercana y profesional, con tono relajado-formal en español natural (RD si aplica).
-
-REGLAS CLAVE
-- No repitas el saludo si ya existe conversación previa (si el historial ya tiene mensajes del bot).
-- Mensajes cortos (máx. 2-3 líneas).
-- Una sola pregunta por mensaje.
-- Emojis variados y naturales (😊✨🚀🙌🧡).
-- No uses etiquetas tipo “[CLIENTE]”.
-- No hagas propuestas largas, diagnósticos extensos ni bullets.
-- No inventes datos si el usuario no lo dijo.
-
-✅ REGLA PARA NOMBRES/REDES (MUY IMPORTANTE)
-- Cuando estés en el paso "redes" (pending = redes), acepta como válido cualquier texto que parezca:
-  a) un @usuario (ej: @jc_import, @xX-Glow✨),
-  b) un link (contenga "http", ".com", ".do", "instagram", "tiktok", "wa.me"),
-  c) o un NOMBRE DE NEGOCIO aunque sea raro (puede tener emojis, números, guiones, mayúsculas, abreviaciones, letras repetidas).
-- NO pidas repetir solo porque el nombre es “raro”.
-- Solo pide repetir si el mensaje tiene 1-2 caracteres, o es claramente un saludo (hola, ok, gracias), o es un ruido tipo "..." o solo emojis sueltos.
-- Si el texto NO parece link/@ pero tiene 3+ caracteres, guárdalo como nombre del negocio en state.redes.
-
-CONTEXTO DE CAMPAÑA
-captar leads clientes
-
-INFORMACIÓN MÍNIMA A OBTENER (solo esto)
-1) rubro
-2) servicio: redes / bot / ambos
-3) redes: link o @; si no tiene, nombre del negocio
-4) objetivo: ventas / leads / reservas / posicionamiento
-
-TAREA
-- Usa el estado recibido (rubro/servicio/redes/objetivo/cerrado/cierre_enviado/pending).
-- Interpreta respuestas de una palabra según la última pregunta (pending).
-- Pregunta SOLO 1 cosa siguiendo el orden rubro -> servicio -> redes -> objetivo.
-- Cuando ya tengas las 4, envía el CIERRE ÚNICO y marca cerrado=true y cierre_enviado=true.
-- Si ya cerraste y el usuario dice ok/gracias/hola/mañana/perfecto/listo/👍 responde SOLO:
-  “¡Listo! Ya quedó registrado 🙌 te escribe un representante.”
-
-CIERRE ÚNICO (usa el servicio y el objetivo final)
-“¡Perfecto! Entonces trabajaremos [servicio] para tu negocio enfocados en [objetivo]. 😊
-Un representante de Zia Lab te estará contactando en breve para presentarte la propuesta”
-
-SALIDA OBLIGATORIA:
-Devuelve SOLO JSON válido (sin texto extra), con este formato:
-{
-  "reply": "mensaje para el usuario",
-  "state": {
-    "rubro": "",
-    "servicio": "",
-    "redes": "",
-    "objetivo": "",
-    "cerrado": false,
-    "cierre_enviado": false,
-    "pending": "rubro|servicio|redes|objetivo|none"
+  try {
+    return raw ? mergeDefaults(JSON.parse(raw)) : defaultMemory();
+  } catch (e) {
+    console.error("[memory] parse error", e?.message || e);
+    return defaultMemory();
   }
 }
 
-Reglas del JSON:
-- "reply" debe ser lo que se enviará al usuario.
-- "state" debe venir actualizado según el último mensaje del usuario y el estado previo.
-- Nunca inventes datos: si no lo dijo, déjalo igual.
-`;
+async function saveMemory(contactId, mem) {
+  const key = `zia:${contactId}`;
+  if (!redis) {
+    localMemory.set(key, mergeDefaults(mem));
+    return;
+  }
+  await redis.set(key, JSON.stringify(mem), "EX", 60 * 60 * 24 * 14);
 }
 
-function inferPending(mem) {
-  if (!mem.rubro) return "rubro";
-  if (!mem.servicio) return "servicio";
-  if (!mem.redes) return "redes";
-  if (!mem.objetivo) return "objetivo";
-  return "none";
+function resetMemoryKeepHistory(mem) {
+  const fresh = defaultMemory();
+  fresh.history = clampHistory(mem?.history || [], 6);
+  return fresh;
 }
 
-function isAck(text) {
-  const t = safeText(text).toLowerCase();
-  return ["ok", "okay", "gracias", "hola", "mañana", "perfecto", "listo", "👍"].includes(t);
+// --- Copy ---
+function askBusinessName() {
+  return "¡Hola! 👋 Gracias por escribir a ZIA Lab.\n\nPara brindarte una atención más personalizada, primero dime: ¿cuál es el nombre de tu negocio?";
+}
+
+function askServiceInterest() {
+  return "Perfecto 🚀 ¿En cuál servicio estás interesado?\n\n1️⃣ Manejo de redes sociales\n2️⃣ Publicidad en Meta / Facebook Ads\n3️⃣ Bot para WhatsApp\n4️⃣ Página web\n5️⃣ Branding\n6️⃣ Foto y video\n7️⃣ Asesoría para saber qué necesito";
+}
+
+function finalLeadReply(mem) {
+  mem.status = "asesoria_pendiente";
+  mem.human_handoff = true;
+  mem.cerrado = true;
+  mem.cierre_enviado = true;
+  mem.pending = "closed";
+
+  return `Listo ✅ Ya registré tu solicitud.\n\nNegocio: ${mem.business_name}\nInterés: ${mem.service_interest}\n\n${ADVISOR_TEXT}`;
+}
+
+function closedReply() {
+  return "¡Listo! Ya tu solicitud quedó registrada 🙌 En breve te escribe un asesor de ZIA Lab.";
+}
+
+// --- Parsers ---
+function parseServiceInterest(text) {
+  const n = optionNumber(text);
+  const map = {
+    "1": "Manejo de redes sociales",
+    "2": "Publicidad en Meta / Facebook Ads",
+    "3": "Bot para WhatsApp",
+    "4": "Página web",
+    "5": "Branding",
+    "6": "Foto y video",
+    "7": "Asesoría para saber qué necesito",
+  };
+  if (map[n]) return map[n];
+
+  if (hasAny(text, ["redes", "instagram", "facebook", "contenido", "manejo de redes", "social media"])) {
+    return "Manejo de redes sociales";
+  }
+  if (hasAny(text, ["publicidad", "ads", "meta", "anuncio", "campaña", "campanas", "facebook ads", "meta ads"])) {
+    return "Publicidad en Meta / Facebook Ads";
+  }
+  if (hasAny(text, ["bot", "whatsapp", "automatizar", "automatizacion", "automatización", "crm", "chatbot"])) {
+    return "Bot para WhatsApp";
+  }
+  if (hasAny(text, ["web", "pagina", "página", "website", "tienda online", "ecommerce", "landing"])) {
+    return "Página web";
+  }
+  if (hasAny(text, ["branding", "logo", "marca", "identidad", "brandbook", "diseño de marca", "diseno de marca"])) {
+    return "Branding";
+  }
+  if (hasAny(text, ["foto", "video", "audiovisual", "reels", "fotografia", "fotografía", "grabacion", "grabación"])) {
+    return "Foto y video";
+  }
+  if (hasAny(text, ["asesoria", "asesoría", "no se", "no sé", "orientacion", "orientación", "ayuda", "que necesito", "qué necesito"])) {
+    return "Asesoría para saber qué necesito";
+  }
+
+  if (safeText(text).length >= 3 && !isGreetingOnly(text)) return safeText(text);
+  return "";
+}
+
+function rememberHistory(mem, userText, reply) {
+  mem.history = clampHistory(
+    [...(mem.history || []), { role: "user", content: userText }, { role: "assistant", content: reply }],
+    12
+  );
+}
+
+function appendLeadSummary(mem) {
+  return {
+    campaign: mem.campaign,
+    business_name: mem.business_name,
+    service_interest: mem.service_interest,
+    status: mem.status,
+    human_handoff: mem.human_handoff,
+  };
+}
+
+function handleConversation(mem, userText) {
+  const text = safeText(userText);
+
+  // Reinicio manual
+  if (hasAny(text, ["reiniciar", "empezar de nuevo", "inicio", "menu", "menú"])) {
+    const fresh = resetMemoryKeepHistory(mem);
+    return { mem: fresh, reply: askBusinessName() };
+  }
+
+  // Regla de oro: cuando el lead ya está cerrado/pasado a asesor, el bot no sigue calificando ni haciendo preguntas.
+  if (mem.cierre_enviado || mem.pending === "closed" || mem.human_handoff) {
+    if (isAck(text) || isGreetingOnly(text)) return { mem, reply: closedReply() };
+    return { mem, reply: "Ya tu solicitud quedó registrada 🙌 Un asesor de ZIA Lab te escribirá en breve. Si quieres iniciar otra consulta, escribe MENÚ." };
+  }
+
+  switch (mem.pending) {
+    case "business_name": {
+      if (isNoise(text) || isGreetingOnly(text)) {
+        return { mem, reply: askBusinessName() };
+      }
+      mem.business_name = text;
+      mem.pending = "service_interest";
+      return { mem, reply: askServiceInterest() };
+    }
+
+    case "service_interest": {
+      const service = parseServiceInterest(text);
+      if (!service) {
+        return { mem, reply: askServiceInterest() };
+      }
+      mem.service_interest = service;
+      mem.servicio = service; // compatibilidad con campos anteriores
+      return { mem, reply: finalLeadReply(mem) };
+    }
+
+    default: {
+      mem.pending = "business_name";
+      return { mem, reply: askBusinessName() };
+    }
+  }
 }
 
 // --- Route ---
@@ -225,7 +276,6 @@ app.post("/mc/reply", async (req, res) => {
   const started = Date.now();
 
   try {
-    // Logs mínimos (Render)
     console.log("[/mc/reply] hit", new Date().toISOString());
 
     if (!mustAuth(req)) {
@@ -233,11 +283,11 @@ app.post("/mc/reply", async (req, res) => {
       return res.status(401).json({ error: "unauthorized" });
     }
 
-    const contactId = safeText(req.body?.contact_id);
-    const userText = safeText(req.body?.user_text);
+    const contactId = safeText(req.body?.contact_id || req.body?.from || req.body?.phone || req.body?.wa_id);
+    const userText = safeText(req.body?.user_text || req.body?.text || req.body?.message);
 
     console.log("[/mc/reply] contact_id:", contactId || "(missing)");
-    console.log("[/mc/reply] user_text:", userText ? `"${userText}"` : "(empty)");
+    console.log("[/mc/reply] user_text:", userText ? `\"${userText}\"` : "(empty)");
 
     if (!contactId) {
       return res.json({ reply: "¿Me confirmas tu mensaje otra vez, porfa? 😊" });
@@ -246,94 +296,18 @@ app.post("/mc/reply", async (req, res) => {
       return res.json({ reply: "Se me quedó el mensaje en blanco 😅 ¿Me lo repites en una línea?" });
     }
 
-    // 1) cargar memoria
-    const mem = await loadMemory(contactId);
-    mem.pending = inferPending(mem);
+    let mem = await loadMemory(contactId);
+    const result = handleConversation(mem, userText);
+    mem = mergeDefaults(result.mem);
+    const reply = safeText(result.reply) || askBusinessName();
 
-    // Si ya cerró y el usuario escribe ack -> respuesta corta
-    if (mem.cierre_enviado && isAck(userText)) {
-      return res.json({ reply: "¡Listo! Ya quedó registrado 🙌 En breve te escribe un representante." });
-    }
-
-    // ✅ NUEVO: si estamos en paso "redes", aceptar nombres raros sin hacer que el modelo pida repetir
-    if (mem.pending === "redes" && !mem.redes) {
-      if (looksLikeLinkOrHandle(userText) || looksLikeBusinessName(userText)) {
-        mem.redes = userText; // guardar tal cual
-        mem.pending = inferPending(mem);
-        // no retornamos todavía: dejamos que el modelo pregunte objetivo con el estado ya actualizado
-      }
-    }
-
-    // 2) armar mensajes
-    const sys = buildSystemPrompt();
-
-    const stateSnapshot = {
-      rubro: mem.rubro,
-      servicio: mem.servicio,
-      redes: mem.redes,
-      objetivo: mem.objetivo,
-      cerrado: !!mem.cerrado,
-      cierre_enviado: !!mem.cierre_enviado,
-      pending: mem.pending
-    };
-
-    const messages = [
-      { role: "system", content: sys },
-      { role: "system", content: `ESTADO ACTUAL: ${JSON.stringify(stateSnapshot)}` },
-      ...clampHistory(mem.history, 10),
-      { role: "user", content: userText }
-    ];
-
-    // 3) OpenAI (forzando JSON)
-    const completion = await openai.chat.completions.create({
-      model: MODEL,
-      messages,
-      temperature: 0.2,
-      max_tokens: 260,
-      response_format: { type: "json_object" } // <-- clave para no romper JSON
-    });
-
-    const raw = completion.choices?.[0]?.message?.content || "{}";
-
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (e) {
-      console.error("[/mc/reply] JSON parse fail:", raw);
-      return res.json({
-        reply: "Se me fue la señal un momentito 😅 ¿Me repites eso en una línea, porfa?"
-      });
-    }
-
-    const reply = safeText(parsed.reply) || "¿Me repites eso en una línea, porfa? 😊";
-    const newState = parsed.state || {};
-
-    // 4) actualizar memoria (estado)
-    mem.rubro = safeText(newState.rubro) || mem.rubro;
-    mem.servicio = safeText(newState.servicio) || mem.servicio;
-
-    // ✅ NUEVO: si ya guardamos redes arriba, no la sobreescribas con vacío
-    mem.redes = safeText(newState.redes) || mem.redes;
-
-    mem.objetivo = safeText(newState.objetivo) || mem.objetivo;
-
-    mem.cerrado = typeof newState.cerrado === "boolean" ? newState.cerrado : mem.cerrado;
-    mem.cierre_enviado =
-      typeof newState.cierre_enviado === "boolean" ? newState.cierre_enviado : mem.cierre_enviado;
-
-    // recalcular pending de forma determinista (anti-loop)
-    mem.pending = inferPending(mem);
-
-    // 5) historial
-    mem.history = clampHistory(
-      [...(mem.history || []), { role: "user", content: userText }, { role: "assistant", content: reply }],
-      12
-    );
-
+    rememberHistory(mem, userText, reply);
     await saveMemory(contactId, mem);
 
+    console.log("[/mc/reply] state:", JSON.stringify(appendLeadSummary(mem)));
     console.log("[/mc/reply] done in", Date.now() - started, "ms");
-    return res.json({ reply });
+
+    return res.json({ reply, lead: appendLeadSummary(mem) });
   } catch (err) {
     console.error("[/mc/reply] ERROR:", err?.stack || err);
     return res.json({ reply: "Se me complicó un momentito 😅 ¿Me lo mandas de nuevo en una línea?" });
